@@ -23,7 +23,7 @@ LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
 
 # Robust error capture (prevents silent exits under set -e)
 set -o errtrace
-trap \'rc=$?; { echo; echo "[ERR] rc=$rc line=$LINENO cmd=$BASH_COMMAND"; } | tee -a "$LOG" >/dev/null; exit $rc\' ERR
+trap 'rc=$?; echo "[ERR] rc=$rc line=$LINENO cmd=$BASH_COMMAND" >>"$LOG"; exit $rc' ERR
 
 MAG="\033[35m"; RST="\033[0m"
 C_CYAN="\033[36m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_RED="\033[31m"
@@ -118,12 +118,20 @@ sanitize_label() { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
 
 check_dependencies() {
   missing=0
+  pkgs=""
+
   echo
   echo "### Dependency check ###"
-  for cmd in ssh rsync awk sed; do
+  for cmd in ssh ssh-keygen rsync awk sed; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       echo "  MISSING: $cmd"
       missing=1
+      case "$cmd" in
+        ssh|ssh-keygen) pkgs="$pkgs openssh-client" ;;
+        rsync)          pkgs="$pkgs rsync" ;;
+        awk)            pkgs="$pkgs gawk" ;;
+        sed)            pkgs="$pkgs sed" ;;
+      esac
     else
       echo "  OK: $cmd"
     fi
@@ -131,10 +139,10 @@ check_dependencies() {
 
   if ! command -v sshpass >/dev/null 2>&1; then
     echo
-    echo "  OPTIONAL (recommended): sshpass"
-    echo "    Used for first-run password bootstrap (ssh-key + rsync)"
+    echo "  OPTIONAL: sshpass"
+    echo "    (Only useful if the lab supports password authentication.)"
     echo "    Install with:"
-    echo "      sudo apt-get install -y sshpass"
+    echo "      sudo apt-get update && sudo apt-get install -y sshpass"
   else
     echo "  OK: sshpass"
   fi
@@ -142,13 +150,16 @@ check_dependencies() {
   if [ "$missing" -eq 1 ]; then
     echo
     echo "One or more REQUIRED dependencies are missing."
-    echo "Please install them before continuing."
+    echo "Install with:"
+    # de-dup package list (cheap uniq)
+    pkgs="$(printf "%s\n" $pkgs | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
+    echo "  sudo apt-get update && sudo apt-get install -y $pkgs"
     exit 1
   fi
   echo
 }
 
-# Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB).
+# Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB). Uses function as display label (fallback LAB).
 iter_hosts() {
   [ -f "$HOSTS_CSV" ] || die "hosts.csv not found: $HOSTS_CSV"
   awk '
@@ -297,6 +308,8 @@ show_files_to_copy() {
 }
 
 go_fast_pipeline() {
+  # UI flow: avoid silent exits under 'set -e'
+  set +e
   ensure_lab_key
   total=4
 
@@ -324,6 +337,7 @@ go_fast_pipeline() {
   set_prompt || true
   progress_step 4 "$total" "Console setup (prompt)" 1
 
+  set -e
   ok "GO! finished (see logs: $LOG)."
   read -rp "Press Enter to return to menu..."
 }
