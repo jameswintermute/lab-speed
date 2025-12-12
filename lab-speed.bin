@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# lab-speed — rapid lab setup utility
+# Copyright (C) 2025 James Wintermute
+# Licensed under GNU GPLv3
+# This program comes with ABSOLUTELY NO WARRANTY.
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+LOG_DIR="$ROOT_DIR/logs"; mkdir -p "$LOG_DIR"
+LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
+HOSTS_CSV="$LOCAL_DIR/hosts.csv"
+CREDS_FILE="$LOCAL_DIR/credentials.txt"
+FILES_DIR="$ROOT_DIR/files-to-copy"
+KNOWN_HOSTS="$ROOT_DIR/known_hosts"
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
+
+# colours
+MAG="\033[35m"
+RST="\033[0m"
+C_CYAN="\033[36m"
+C_GRN="\033[32m"
+C_YEL="\033[33m"
+C_RED="\033[31m"
+BOLD="\033[1m"
+
+log()  { printf "%b\n" "$*" | tee -a "$LOG" >/dev/null; }
+info() { log "${C_CYAN}[INFO]${RST} $*"; }
+ok()   { log "${C_GRN}[ OK ]${RST} $*"; }
+warn() { log "${C_YEL}[WARN]${RST} $*"; }
+err()  { log "${C_RED}[ERR ]${RST} $*"; }
+die()  { err "$*"; exit 1; }
+
+header() {
+  clear
+  printf "%b" "$MAG"
+  printf "%s\n" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
+  printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
+  printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
+  printf "\n%s\n" "      A rapid lab setup utility"
+  printf "\n%s\n" "      v1.0.1 - Dec 2025. James Wintermute"
+  printf "%b\n" "$RST"
+}
+
+# step progress bar
+progress_step() {
+  cur="$1"; total="$2"; msg="$3"; done="${4:-0}"
+  width=24
+  filled=$(( (cur * width) / total ))
+  [ "$filled" -lt 0 ] && filled=0
+  [ "$filled" -gt "$width" ] && filled="$width"
+  empty=$(( width - filled ))
+  bar_filled="$(printf '%*s' "$filled" '' | tr ' ' '#')"
+  bar_empty="$(printf '%*s' "$empty" '' | tr ' ' '-')"
+  col="$C_CYAN"
+  [ "$done" = "1" ] && col="$C_GRN"
+  printf "\r%b[%s%s]%b %s/%s %s%b" "$col" "$bar_filled" "$bar_empty" "$RST" "$cur" "$total" "$msg" "$RST"
+  [ "$done" = "1" ] && printf "\n"
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+ssh_opts() { echo "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10"; }
+sh_quote() { printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"; }
+
+ensure_creds() {
+  if [ ! -f "$CREDS_FILE" ]; then
+    umask 077
+    cat >"$CREDS_FILE" <<'EOF'
+# lab-speed credentials (chmod 600)
+username=""
+password=""
+SSHPASS=""
+EOF
+    chmod 600 "$CREDS_FILE" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC1090
+  . "$CREDS_FILE" || true
+
+  if [ -z "${username:-}" ] || [ -z "${password:-}" ] || [ -z "${SSHPASS:-}" ]; then
+    echo
+    echo "Please enter the following credentials for your lab."
+    echo "They will be stored securely in local/credentials.txt"
+    echo
+    read -rp "  username: " _u
+    read -rsp "  password: " _p; echo
+    read -rsp "  SSHPASS (press Enter to use same as password): " _s; echo
+    [ -z "$_s" ] && _s="$_p"
+
+    umask 077
+    {
+      echo "# lab-speed credentials (chmod 600)"
+      echo "username=$(sh_quote "$_u")"
+      echo "password=$(sh_quote "$_p")"
+      echo "SSHPASS=$(sh_quote "$_s")"
+    } >"$CREDS_FILE"
+    chmod 600 "$CREDS_FILE" 2>/dev/null || true
+
+    # shellcheck disable=SC1090
+    . "$CREDS_FILE"
+  fi
+}
+
+sanitize_label() { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
+
+hosts_nonempty() {
+  # Returns 0 if at least one data row exists after header, else 1
+  [ -f "$HOSTS_CSV" ] || return 1
+  n="$(awk 'NR==1{next} /^[ \t]*$/ {next} /^[ \t]*#/ {next} {c++} END{print c+0}' "$HOSTS_CSV" 2>/dev/null || echo 0)"
+  [ "${n:-0}" -gt 0 ]
+}
+
+iter_hosts() {
+  [ -f "$HOSTS_CSV" ] || die "hosts.csv not found: $HOSTS_CSV"
+  awk '
+  function lcase(s) { return tolower(s) }
+  function trim(s)  { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+  BEGIN { FS=","; OFS="|" }
+  NR==1 { for (i=1;i<=NF;i++) { h=trim(lcase($i)); idx[h]=i } ; next }
+  /^[ \t]*$/ { next }
+  /^[ \t]*#/ { next }
+  {
+    ssh_host=""
+    if ("external-ip" in idx)      ssh_host=trim($(idx["external-ip"]))
+    else if ("external_ip" in idx) ssh_host=trim($(idx["external_ip"]))
+    else if ("host" in idx)        ssh_host=trim($(idx["host"]))
+    else if ("hostname" in idx)    ssh_host=trim($(idx["hostname"]))
+    else if ("ip" in idx)          ssh_host=trim($(idx["ip"]))
+    if (ssh_host=="") next
+
+    fn=""
+    if ("function" in idx) fn=trim($(idx["function"]))
+    else if ("role" in idx) fn=trim($(idx["role"]))
+    if (fn=="") fn="LAB"
+
+    print ssh_host, fn
+  }' "$HOSTS_CSV"
+}
+
+validate_hosts() {
+  hosts_nonempty || die "local/hosts.csv has only a header (no hosts). Please add your lab hosts first."
+  n=0
+  while IFS='|' read -r ssh_host fn; do
+    n=$((n+1))
+    [ -z "$ssh_host" ] && die "Invalid row $n (external-ip/host/ip empty)"
+  done < <(iter_hosts)
+  ok "hosts.csv OK ($n host(s))"
+}
+
+check_prereqs() {
+  need ssh
+  need rsync
+  if ! command -v sshpass >/dev/null 2>&1; then
+    warn "sshpass not installed. Install: sudo apt-get install -y sshpass"
+  fi
+}
+
+push_keys() { check_prereqs; ensure_creds; :; }
+copy_files() { check_prereqs; ensure_creds; :; }
+set_prompt() { check_prereqs; ensure_creds; :; }
+
+show_hosts() {
+  echo
+  echo "---- local/hosts.csv ----"
+  sed 's/^/  /' "$HOSTS_CSV" 2>/dev/null || echo "  (missing $HOSTS_CSV)"
+  echo "-------------------------"
+  read -rp "Press Enter to continue..."
+}
+
+show_files_to_copy() {
+  echo
+  echo "---- files-to-copy/ ----"
+  (ls -lah "$FILES_DIR" 2>/dev/null || echo "  (empty)") | sed 's/^/  /'
+  echo "------------------------"
+  read -rp "Press Enter to continue..."
+}
+
+go_fast_pipeline() {
+  total=4
+  progress_step 1 "$total" "Validating hosts.csv" 0
+  validate_hosts
+  progress_step 1 "$total" "Validating hosts.csv" 1
+
+  progress_step 2 "$total" "Copying SSH keys" 0
+  push_keys
+  progress_step 2 "$total" "Copying SSH keys" 1
+
+  progress_step 3 "$total" "RSYNC files to /tmp/lab-speed" 0
+  copy_files
+  progress_step 3 "$total" "RSYNC files to /tmp/lab-speed" 1
+
+  progress_step 4 "$total" "Console setup (prompt)" 0
+  set_prompt
+  progress_step 4 "$total" "Console setup (prompt)" 1
+
+  ok "GO! complete."
+  read -rp "Press Enter to return to menu..."
+}
+
+go_submenu() {
+  # On entry, check hosts.csv has content
+  while ! hosts_nonempty; do
+    header
+    echo
+    warn "local/hosts.csv is empty (header only)."
+    echo
+    echo "Please populate: ${HOSTS_CSV}"
+    echo
+    echo "Options:"
+    echo "  s) Show hosts.csv"
+    echo "  r) Refresh hosts.csv (re-check)"
+    echo "  x) Back"
+    printf "Select an option: "
+    read -r k
+    case "$k" in
+      s|S) show_hosts ;;
+      r|R) : ;;  # loop repeats and re-checks
+      x|X) return 0 ;;
+      *) echo "Invalid option"; sleep 0.8 ;;
+    esac
+  done
+
+  while true; do
+    header
+    echo
+    echo "### GO! Pre-flight checklist ###"
+    echo "  a) Review files-to-copy (recommended)"
+    echo "  b) Show hosts.csv"
+    echo "  r) Refresh hosts.csv"
+    echo "  c) Start GO! (run all steps)"
+    echo
+    echo "  x) Back"
+    printf "Select an option: "
+    read -r s
+    case "$s" in
+      a|A) show_files_to_copy ;;
+      b|B) show_hosts ;;
+      r|R) : ;;
+      c|C)
+        echo
+        echo "${BOLD}Before we begin:${RST} please ensure everything you want copied is in:"
+        echo "  ${FILES_DIR}"
+        echo
+        read -rp "Proceed with GO!? (y/N): " yn
+        case "${yn:-N}" in
+          y|Y) go_fast_pipeline ;;
+          *) echo "Cancelled."; sleep 0.8 ;;
+        esac
+        ;;
+      x|X) return 0 ;;
+      *) echo "Invalid option"; sleep 0.8 ;;
+    esac
+  done
+}
+
+cleanup_creds() {
+  read -rp "Are you sure you want to delete credentials? (y/N): " a
+  case "$a" in y|Y) rm -f "$CREDS_FILE"; ok "Credentials removed." ;; *) info "Cancelled." ;; esac
+  sleep 0.8
+}
+
+print_menu() {
+  echo
+  echo "### GO! - High Speed start ###"
+  echo "  1) Copy ssh-keys, RSYNC files to lab '/tmp', Console setup"
+  echo
+  echo "### Individual functions ###"
+  echo "  2) RSYNC distribute files to /tmp"
+  echo "  3) Set ssh-keys (ssh-copy-id) to each host"
+  echo "  4) Set ~/.bash_profile prompt from hosts.csv function/role"
+  echo
+  echo "### Inspection ###"
+  echo "  6) Show hosts.csv"
+  echo
+  echo "### Clean-Up ###"
+  echo "  5) Clean Up, delete creds"
+  echo
+  echo "  q) Quit"
+  printf "Select an option: "
+}
+
+main() {
+  header
+  sleep 0.6
+  ensure_creds
+
+  while true; do
+    header
+    print_menu
+    read -r c
+    case "$c" in
+      1) go_submenu ;;
+      2) copy_files; read -rp "Press Enter..." ;;
+      3) push_keys; read -rp "Press Enter..." ;;
+      4) set_prompt; read -rp "Press Enter..." ;;
+      5) cleanup_creds ;;
+      6) show_hosts ;;
+      q|Q) exit 0 ;;
+      *) warn "Invalid option"; sleep 0.8 ;;
+    esac
+  done
+}
+
+main
