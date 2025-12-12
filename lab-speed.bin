@@ -293,6 +293,7 @@ show_files_to_copy() {
 }
 
 go_fast_pipeline() {
+  ensure_lab_key
   total=4
 
   progress_step 1 "$total" "Validating hosts.csv" 0
@@ -493,6 +494,7 @@ main() {
   check_dependencies
   sleep 0.6
   ensure_creds
+  ensure_lab_key
   while true; do
     header
     print_menu
