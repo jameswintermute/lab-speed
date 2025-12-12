@@ -29,7 +29,7 @@ Or edit manually:
 `local/credentials.txt`
 ```bash
 # lab-speed credentials (chmod 600)
-username="sccStudent"
+username="value"
 password="YOUR_LAB_PASSWORD"
 SSHPASS="YOUR_LAB_PASSWORD"   # usually same as password
 ```
@@ -44,8 +44,8 @@ Example:
 
 ```csv
 host-url,external-ip,internal-ip,function
-https://example-cm,18.216.186.182,10.0.0.1,Splunk-CM
-https://example-idx1,3.138.157.157,10.0.0.2,Splunk-IDX1
+https://example-cm,1.2.3.4,10.0.0.1,Splunk-CM
+https://example-idx1,2.3.5.157,10.0.0.2,Splunk-IDX1
 ```
 
 ### 4) Put files you want copied into `files-to-copy/`
