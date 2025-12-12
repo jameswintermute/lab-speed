@@ -100,6 +100,9 @@ ensure_creds() {
 sanitize_label()
 
 
+ { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
+
+
 check_dependencies() {
   missing=0
   echo
@@ -131,7 +134,6 @@ check_dependencies() {
   fi
   echo
 }
- { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
 
 # Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB).
 iter_hosts() {
