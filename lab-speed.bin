@@ -98,6 +98,12 @@ ssh_opts_interactive() {
   # Interactive shells are allowed to prompt (used only for lab-connect).
   echo "$(ssh_opts) -o PreferredAuthentications=publickey"
 }
+auth_check() {
+  # Returns 0 if key auth works; non-zero otherwise. Never prompts.
+  host="$1"
+  ssh $(ssh_opts_keyonly) -p 22 "$username@$host" "true" >/dev/null 2>&1
+  return $?
+}
 
 ensure_creds_file() {
   if [ ! -f "$CREDS_FILE" ]; then
@@ -501,6 +507,16 @@ lab_connect_menu() {
           sel="$(sed -n "${idx}p" "$tmp")"
           sel_lbl="${sel%%|*}"
           sel_host="${sel#*|}"
+          if ! auth_check "$sel_host"; then
+            err "Key auth not yet enabled for $sel_host ($sel_lbl). Install the public key for user \"$username\" then retry."
+            echo
+            echo "Public key (copy/paste to lab admin; do NOT run as a command):"
+            echo
+            sed 's/^/  /' "$LAB_PUB"
+            echo
+            read -rp "Press Enter to return..." 
+            continue
+          fi
           info "Opening SSH window: $username@$sel_host ($sel_lbl)"
           open_ssh_window "$sel_host" "$username"
         else
