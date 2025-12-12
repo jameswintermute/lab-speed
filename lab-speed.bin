@@ -21,6 +21,10 @@ LAB_PUB="$LOCAL_DIR/lab_speed_ed25519.pub"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
 
+# Robust error capture (prevents silent exits under set -e)
+set -o errtrace
+trap \'rc=$?; { echo; echo "[ERR] rc=$rc line=$LINENO cmd=$BASH_COMMAND"; } | tee -a "$LOG" >/dev/null; exit $rc\' ERR
+
 MAG="\033[35m"; RST="\033[0m"
 C_CYAN="\033[36m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_RED="\033[31m"
 BOLD="\033[1m"
@@ -297,7 +301,11 @@ go_fast_pipeline() {
   total=4
 
   progress_step 1 "$total" "Validating hosts.csv" 0
-  if ! validate_hosts; then
+  set +e
+  validate_hosts
+  _vh_rc=$?
+  set -e
+  if [ "$_vh_rc" -ne 0 ]; then
     progress_step 1 "$total" "Validating hosts.csv" 1
     read -rp "Press Enter to return..." 
     return 1
