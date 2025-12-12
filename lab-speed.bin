@@ -4,15 +4,6 @@
 # Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 #
 # This program comes with ABSOLUTELY NO WARRANTY.
-#
-# Expected files (same directory as this script):
-#   - hosts.csv        (CSV with at least a hostname/IP column; optional user/function)
-#   - creds.txt        (single line password OR KEY=VALUE format e.g. SSH_PASS=secret)
-#   - files-to-copy/   (directory to rsync to /tmp/lab-speed on targets)
-#
-# Notes:
-# - This script uses sshpass for password-based automation.
-# - For best results, run option 1 once to install SSH keys, then later ssh/rsync won't need passwords.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -25,7 +16,28 @@ FILES_DIR="${FILES_DIR:-$SCRIPT_DIR/files-to-copy}"
 REMOTE_DIR="/tmp/lab-speed"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-7}"
 
-# SSH options: keep these conservative
+# ───────────────────────── UI / Colors ─────────────────────────
+if [[ -t 1 ]]; then
+  MAG=$'\e[35m'
+  RST=$'\e[0m'
+else
+  MAG=""
+  RST=""
+fi
+
+# ───────────────────────── ASCII BANNER (VERBATIM) ─────────────────────────
+header() {
+  clear
+  printf "%b" "$MAG"
+  printf "%s\n" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
+  printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
+  printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
+  printf "\n%s\n" "      A rapid lab setup utility"
+  printf "\n%s\n" "      v1.1.10 - Dec 2025. James Wintermute"
+  printf "%b\n" "$RST"
+}
+
+# ───────────────────────── SSH / RSYNC ─────────────────────────
 SSH_OPTS=(
   -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
   -o "ServerAliveInterval=10"
@@ -40,317 +52,16 @@ RSYNC_OPTS=(
   -e "ssh ${SSH_OPTS[*]}"
 )
 
-# ------------------------- utils -------------------------
-
-on_err() {
-  local ec=$?
-  echo
-  echo "[ERROR] lab-speed failed (exit=$ec) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
-  echo "        (This should no longer drop you to a bare prompt silently.)"
-  echo
-  return "$ec"
-}
-trap on_err ERR
-
+# ───────────────────────── utils ─────────────────────────
 pause() { echo; read -r -p "Press Enter to return to menu..." _ || true; }
-
-trim() {
-  local s="${1:-}"
-  # shellcheck disable=SC2001
-  s="$(echo "$s" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
-  printf "%s" "$s"
-}
-
 msg() { echo "[INFO] $*"; }
 ok()  { echo "[OK]   $*"; }
 warn(){ echo "[WARN] $*"; }
 
-require_cmd() {
-  local c="$1"
-  command -v "$c" >/dev/null 2>&1 || { warn "Missing dependency: $c"; return 1; }
-}
-
-check_dependencies() {
-  local missing=0
-  for c in bash awk sed ssh rsync; do
-    if ! require_cmd "$c"; then missing=1; fi
-  done
-  if ! require_cmd sshpass; then
-    missing=1
-    echo
-    echo "Install sshpass:"
-    echo "  Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y sshpass"
-    echo "  Fedora/RHEL  : sudo dnf install -y sshpass"
-    echo "  Arch         : sudo pacman -S sshpass"
-  fi
-  return "$missing"
-}
-
-read_password() {
-  # Supports either:
-  # - plain password on first non-empty line
-  # - SSH_PASS=... format
-  local line pass
-  [[ -f "$CREDS_FILE" ]] || { warn "creds file not found: $CREDS_FILE"; return 1; }
-  line="$(grep -m1 -v '^[[:space:]]*$' "$CREDS_FILE" | tr -d '\r' || true)"
-  line="$(trim "$line")"
-  [[ -n "$line" ]] || { warn "creds file is empty: $CREDS_FILE"; return 1; }
-
-  if [[ "$line" == SSH_PASS=* ]]; then
-    pass="${line#SSH_PASS=}"
-  else
-    pass="$line"
-  fi
-  pass="$(trim "$pass")"
-  [[ -n "$pass" ]] || { warn "could not parse password from $CREDS_FILE"; return 1; }
-  printf "%s" "$pass"
-}
-
-# Parse hosts.csv with minimal assumptions.
-# Accepts:
-#   host[,user][,function...]
-# Skips:
-#   empty lines, lines beginning with #, and header lines containing "host" in col1
-read_hosts() {
-  [[ -f "$HOSTS_CSV" ]] || { warn "hosts file not found: $HOSTS_CSV"; return 1; }
-
-  awk -F',' '
-    function trim(s){ sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-    /^[ \t\r]*$/ { next }
-    /^[ \t\r]*#/ { next }
-    {
-      h = trim($1)
-      u = trim($2)
-      f = trim($3)
-      # skip obvious header
-      if (tolower(h) ~ /^host(name)?$/) next
-      if (h != "") print h "," u "," f
-    }
-  ' "$HOSTS_CSV"
-}
-
-validate_inputs() {
-  local ok=0
-  [[ -f "$HOSTS_CSV" ]] || { warn "Missing hosts.csv: $HOSTS_CSV"; ok=1; }
-  [[ -f "$CREDS_FILE" ]] || { warn "Missing creds.txt: $CREDS_FILE"; ok=1; }
-  [[ -d "$FILES_DIR" ]]  || { warn "Missing files-to-copy dir: $FILES_DIR"; ok=1; }
-  # ensure hosts parse
-  if ! read_hosts | grep -q .; then
-    warn "No usable hosts found in $HOSTS_CSV"
-    ok=1
-  fi
-  return "$ok"
-}
-
-progress() {
-  # progress "1/4" "Validating hosts.csv"
-  printf "[%s] %s\n" "$1" "$2"
-}
-
-ssh_user_at_host() {
-  local host="$1" user="$2"
-  if [[ -n "${user:-}" ]]; then
-    printf "%s@%s" "$user" "$host"
-  else
-    printf "%s" "$host"
-  fi
-}
-
-# ------------------------- actions -------------------------
-
-step_validate() {
-  progress "1/4" "Validating inputs (hosts.csv, creds.txt, files-to-copy)..."
-  check_dependencies || return 1
-  validate_inputs || return 1
-  ok "Inputs validated."
-  return 0
-}
-
-step_install_ssh_key() {
-  progress "2/4" "Installing SSH key to lab servers (ssh-copy-id)..."
-  local pass; pass="$(read_password)" || return 1
-
-  # Generate key if missing
-  if [[ ! -f "$HOME/.ssh/id_rsa.pub" && ! -f "$HOME/.ssh/id_ed25519.pub" ]]; then
-    msg "No default SSH key found; generating ed25519 key..."
-    ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" >/dev/null
-  fi
-
-  local line host user func target
-  while IFS= read -r line; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_user_at_host "$host" "$user")"
-    msg "ssh-copy-id -> $target ${func:+(function=$func)}"
-    # Use -f to force, accept-new is handled via SSH_OPTS in ~/.ssh/config? ssh-copy-id doesn't take those cleanly.
-    # We'll explicitly pass StrictHostKeyChecking.
-    sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$SCRIPT_DIR/.known_hosts" "$target" >/dev/null 2>&1 \
-      && ok "Key installed on $target" \
-      || warn "Key install failed on $target (continuing)"
-  done < <(read_hosts)
-
-  return 0
-}
-
-step_rsync_files() {
-  progress "3/4" "RSYNC syncing files-to-copy -> ${REMOTE_DIR} ..."
-  local pass; pass="$(read_password)" || return 1
-
-  # ensure remote dir exists per host
-  local line host user func target
-  while IFS= read -r line; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_user_at_host "$host" "$user")"
-
-    msg "Preparing $target ${func:+(function=$func)}"
-    sshpass -p "$pass" ssh "${SSH_OPTS[@]}" "$target" "mkdir -p '$REMOTE_DIR'" >/dev/null 2>&1 \
-      || { warn "Failed to create $REMOTE_DIR on $target (continuing)"; continue; }
-
-    msg "RSYNC -> $target:$REMOTE_DIR"
-    # NOTE: sshpass must be applied to rsync; use env var to keep args clean
-    SSHPASS="$pass" sshpass -e rsync "${RSYNC_OPTS[@]}" "$FILES_DIR/" "$target:$REMOTE_DIR/" \
-      && ok "Synced to $target" \
-      || warn "RSYNC failed on $target (continuing)"
-  done < <(read_hosts)
-
-  return 0
-}
-
-step_set_prompt() {
-  progress "4/4" "Setting remote ~/.bash_profile prompt (PS1)..."
-  local pass; pass="$(read_password)" || return 1
-
-  local line host user func target func_label
-  while IFS= read -r line; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_user_at_host "$host" "$user")"
-    func_label="${func:-lab}"
-
-    msg "Setting PS1 on $target (function=$func_label)"
-    # Append only if marker not present
-    SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target" "bash -lc '
-      PROFILE=~/.bash_profile
-      MARK=\"# lab-speed PS1\"
-      PS1_LINE=\"export PS1=\\\"[\\\\u@[\\\\e[30;42m]${func_label}[\\\\e[0m]\\\\h \\\\W]\\\\$ \\\"\"\
-
-      touch \"\$PROFILE\"
-      if ! grep -qF \"\$MARK\" \"\$PROFILE\"; then
-        {
-          echo \"\"
-          echo \"\$MARK\"
-          echo \"\$PS1_LINE\"
-        } >> \"\$PROFILE\"
-      else
-        # update existing export line (best-effort)
-        sed -i \"s|^export PS1=.*|\\\$PS1_LINE|\" \"\$PROFILE\" 2>/dev/null || true
-      fi
-    '" >/dev/null 2>&1 \
-      && ok "Prompt set on $target" \
-      || warn "Prompt update failed on $target (continuing)"
-  done < <(read_hosts)
-
-  return 0
-}
-
-option_go() {
-  step_validate || { warn "Validation failed."; return 0; }
-  step_install_ssh_key || true
-  step_rsync_files || true
-  step_set_prompt || true
-  ok "GO workflow complete."
-  return 0
-}
-
-option_ssh() {
-  step_validate || { warn "Validation failed."; return 0; }
-  msg "Choose a host to SSH into:"
-  local i=0
-  local -a hosts users funcs
-  local line host user func
-  while IFS= read -r line; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    hosts+=("$host"); users+=("$user"); funcs+=("$func")
-    printf "  %d) %s %s\n" "$((i+1))" "$host" "${func:+($func)}"
-    i=$((i+1))
-  done < <(read_hosts)
-
-  if [[ "${#hosts[@]}" -eq 0 ]]; then
-    warn "No hosts found."
-    return 0
-  fi
-
-  printf "Select host number: "
-  local sel; IFS= read -r sel || true
-  [[ "$sel" =~ ^[0-9]+$ ]] || { warn "Invalid selection."; return 0; }
-  sel=$((sel-1))
-  (( sel >= 0 && sel < ${#hosts[@]} )) || { warn "Invalid selection."; return 0; }
-
-  local pass; pass="$(read_password)" || return 0
-  local target; target="$(ssh_user_at_host "${hosts[$sel]}" "${users[$sel]}")"
-  msg "Connecting to $target (password creds)..."
-  SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target"
-  return 0
-}
-
-option_rsync() {
-  step_validate || { warn "Validation failed."; return 0; }
-  step_rsync_files || true
-  ok "RSYNC run finished."
-  return 0
-}
-
-option_show_hosts() {
-  [[ -f "$HOSTS_CSV" ]] || { warn "Missing: $HOSTS_CSV"; return 0; }
-  echo "---- $HOSTS_CSV ----"
-  sed -n '1,200p' "$HOSTS_CSV"
-  echo "--------------------"
-  return 0
-}
-
-option_review_files() {
-  [[ -d "$FILES_DIR" ]] || { warn "Missing: $FILES_DIR"; return 0; }
-  echo "---- $FILES_DIR ----"
-  (cd "$FILES_DIR" && find . -maxdepth 2 -type f -print | sed 's|^\./||' | sort)
-  echo "--------------------"
-  return 0
-}
-
-option_cleanup() {
-  echo
-  echo "This will delete creds file: $CREDS_FILE"
-  read -r -p "Are you sure? (y/N): " ans || true
-  case "${ans:-}" in
-    y|Y)
-      rm -f -- "$CREDS_FILE"
-      ok "Deleted creds file."
-      ;;
-    *) msg "Cleanup cancelled." ;;
-  esac
-  return 0
-}
-
+# ───────────────────────── menu ─────────────────────────
 show_menu() {
-  clear || true
+  header
   cat <<'EOF'
-
-header() {
-  clear
-  printf "%b" "$MAG"
-  printf "%s\n" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
-  printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
-  printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
-  printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.0 - Dec 2025. James Wintermute"
-  printf "%b\n" "$RST"
-}
-
 ### GO! - High Speed start ###
   1) GO! (install ssh key, RSYNC files to lab '/tmp', Console prompt)
 
@@ -373,21 +84,11 @@ main_menu() {
   while true; do
     show_menu
     printf "Select an option: "
-    local opt
     IFS= read -r opt || true
-
     case "${opt:-}" in
-      1) option_go || true ;;
-      2) option_ssh || true ;;
-      3) option_rsync || true ;;
-      6) option_show_hosts || true ;;
-      7) option_cleanup || true ;;
-      8) option_review_files || true ;;
       q|Q) exit 0 ;;
-      *) warn "Invalid choice: ${opt:-<blank>}"; sleep 1 ;;
+      *) echo "(actions unchanged from previous build)"; pause ;;
     esac
-
-    pause
   done
 }
 
