@@ -12,7 +12,7 @@ LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 HOSTS_CSV="$LOCAL_DIR/hosts.csv"
 CREDS_FILE="$LOCAL_DIR/credentials.txt"
 FILES_DIR="$ROOT_DIR/files-to-copy"
-KNOWN_HOSTS="$ROOT_DIR/known_hosts"
+KNOWN_HOSTS="$LOCAL_DIR/known_hosts"
 
 # Dedicated per-project lab SSH identity (not tied to local user account)
 LAB_KEY="$LOCAL_DIR/lab_speed_ed25519"
@@ -20,6 +20,11 @@ LAB_PUB="$LOCAL_DIR/lab_speed_ed25519.pub"
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
+
+# Ensure per-project known_hosts lives under local/
+mkdir -p "$LOCAL_DIR"
+touch "$KNOWN_HOSTS" 2>/dev/null || true
+chmod 600 "$KNOWN_HOSTS" 2>/dev/null || true
 
 # Robust error capture (prevents silent exits under set -e)
 set -o errtrace
@@ -43,7 +48,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.1 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.3 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
 
@@ -91,7 +96,8 @@ ssh_opts() {
 
 ssh_opts_keyonly() {
   # Non-interactive: never prompt for password; fail fast if key isn't installed server-side.
-  echo "$(ssh_opts) -o BatchMode=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no"
+  # Uses the per-project lab key in local/.
+  echo "$(ssh_opts) -i $LAB_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no"
 }
 
 ssh_opts_interactive() {
@@ -103,6 +109,26 @@ auth_check() {
   host="$1"
   ssh $(ssh_opts_keyonly) -p 22 "$username@$host" "true" >/dev/null 2>&1
   return $?
+}
+bootstrap_key_with_password() {
+  host="$1"; label="$2"
+  if ! need sshpass; then
+    return 127
+  fi
+  if [ -z "${SSHPASS:-}" ]; then
+    return 2
+  fi
+  # Use password auth once to install our lab public key into authorized_keys
+  export SSHPASS="$SSHPASS"
+  sshpass -e ssh $(ssh_opts) -p 22 "$username@$host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" < "$LAB_PUB" >/dev/null 2>&1
+  rc=$?
+  unset SSHPASS
+  if [ $rc -ne 0 ]; then
+    err "Password bootstrap failed for $host ($label)."
+    return 1
+  fi
+  ok "Key installed via password bootstrap on $host ($label)."
+  return 0
 }
 
 ensure_creds_file() {
@@ -253,7 +279,6 @@ push_keys() {
   echo
   warn "It should be added to: ~${username}/.ssh/authorized_keys"
   echo
-  read -rp "Press Enter to continue..."
   return 0
 }
 
@@ -305,6 +330,14 @@ set_prompt() {
     i=$((i+1))
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] Console setup (prompt) -> $username@$ssh_host ($lbl)"
+    # Ensure key auth is enabled (attempt password bootstrap if possible)
+    if ! auth_check "$ssh_host"; then
+      bootstrap_key_with_password "$ssh_host" "$lbl" >/dev/null 2>&1 || true
+    fi
+    if ! auth_check "$ssh_host"; then
+      failures=$((failures+1)); err "Prompt setup skipped (no key auth) for $ssh_host ($lbl)."
+      continue
+    fi
     set +e
     ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "grep -q 'lab-speed:prompt' ~/.bash_profile 2>/dev/null || cat >> ~/.bash_profile <<'EOF'
 # lab-speed:prompt
@@ -327,7 +360,6 @@ show_hosts() {
   echo "---- local/hosts.csv ----"
   sed 's/^/  /' "$HOSTS_CSV"
   echo "-------------------------"
-  read -rp "Press Enter to continue..."
 }
 
 show_files_to_copy() {
@@ -339,7 +371,6 @@ show_files_to_copy() {
   size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
   echo "  Files: $count    Size: ${size:-0}"
   echo "------------------------"
-  read -rp "Press Enter to continue..."
 }
 
 go_fast_pipeline() {
@@ -374,7 +405,6 @@ go_fast_pipeline() {
 
   set -e
   ok "GO! finished (see logs: $LOG)."
-  read -rp "Press Enter to return to menu..."
 }
 
 refresh_hosts_prompt() {
@@ -436,7 +466,16 @@ go_submenu() {
 
 open_ssh_window() {
   host="$1"; user="$2"
-  cmd="ssh $(ssh_opts_interactive) ${user}@${host}"
+
+  # lab-connect is intentionally password-first for speed.
+  # If sshpass is available and credentials are set, use it to avoid prompts.
+  # Otherwise fall back to normal ssh (user may be prompted).
+  if need sshpass && [ -f "$CREDS_FILE" ]; then
+    cmd="bash -lc 'set -e; . "$CREDS_FILE" >/dev/null 2>&1 || true; export SSHPASS="${SSHPASS:-}"; if [ -n "${SSHPASS:-}" ]; then sshpass -e ssh $(ssh_opts) -o PreferredAuthentications=password -o PubkeyAuthentication=no ${user}@${host}; else ssh $(ssh_opts) ${user}@${host}; fi'"
+  else
+    cmd="ssh $(ssh_opts) ${user}@${host}"
+  fi
+
   if command -v gnome-terminal >/dev/null 2>&1; then
     gnome-terminal -- bash -lc "$cmd; echo; echo 'Session ended.'; read -n1 -r -p 'Press any key to close...'"
     return 0
@@ -460,6 +499,7 @@ open_ssh_window() {
   warn "No supported terminal emulator found; running SSH in current terminal."
   exec $cmd
 }
+
 
 lab_connect_menu() {
   ensure_creds
@@ -507,16 +547,6 @@ lab_connect_menu() {
           sel="$(sed -n "${idx}p" "$tmp")"
           sel_lbl="${sel%%|*}"
           sel_host="${sel#*|}"
-          if ! auth_check "$sel_host"; then
-            err "Key auth not yet enabled for $sel_host ($sel_lbl). Install the public key for user \"$username\" then retry."
-            echo
-            echo "Public key (copy/paste to lab admin; do NOT run as a command):"
-            echo
-            sed 's/^/  /' "$LAB_PUB"
-            echo
-            read -rp "Press Enter to return..." 
-            continue
-          fi
           info "Opening SSH window: $username@$sel_host ($sel_lbl)"
           open_ssh_window "$sel_host" "$username"
         else
