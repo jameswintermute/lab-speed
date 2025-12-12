@@ -53,7 +53,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.4 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.6 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
 
@@ -376,22 +376,47 @@ EOF
 
 
 show_hosts() {
+  header
   echo
   echo "---- local/hosts.csv ----"
-  sed 's/^/  /' "$HOSTS_CSV"
-  echo "-------------------------"
+  if command -v less >/dev/null 2>&1; then
+    # Page the file for readability (q to quit)
+    sed 's/^/  /' "$HOSTS_CSV" | less -RSX
+  else
+    sed 's/^/  /' "$HOSTS_CSV"
+    echo "-------------------------"
+    echo
+    read -rp "Press Enter to continue..."
+  fi
 }
 
+
 show_files_to_copy() {
+  header
   echo
   echo "---- files-to-copy/ ----"
-  (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
-  echo
-  count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
-  echo "  Files: $count    Size: ${size:-0}"
-  echo "------------------------"
+  if command -v less >/dev/null 2>&1; then
+    {
+      (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
+      echo
+      count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+      size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
+      echo "  Files: $count    Size: ${size:-0}"
+      echo "------------------------"
+      echo
+      echo "  Tip: press 'q' to return."
+    } | less -RSX
+  else
+    (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
+    echo
+    count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
+    echo "  Files: $count    Size: ${size:-0}"
+    echo "------------------------"
+    read -rp "Press Enter to continue..."
+  fi
 }
+
 
 go_fast_pipeline() {
   # UI flow: avoid silent exits under 'set -e'
@@ -604,7 +629,7 @@ print_menu() {
   echo "  2) SSH to the servers in our hosts file"
   echo
   echo "### Individual functions ###"
-  echo "  3) RSYNC distribute files to /tmp"
+  echo "  3) RSYNC distribute files to lab servers '/tmp' directory"
   echo "  4) Set ssh-keys (ssh-copy-id) to each host"
   echo "  5) Set ~/.bash_profile prompt from hosts.csv function"
   echo
@@ -631,9 +656,9 @@ main() {
     case "$c" in
       1) go_submenu ;;
       2) lab_connect_menu ;;
-      3) copy_files; read -rp "Press Enter..." ;;
-      4) push_keys; read -rp "Press Enter..." ;;
-      5) set_prompt; read -rp "Press Enter..." ;;
+      3) copy_files || true; read -rp "Press Enter..." ;;
+      4) push_keys || true; read -rp "Press Enter..." ;;
+      5) set_prompt || true; read -rp "Press Enter..." ;;
       6) show_hosts ;;
       7) cleanup_creds ;;
       q|Q) exit 0 ;;
