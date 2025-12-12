@@ -12,7 +12,7 @@ LOCAL_DIR="$ROOT_DIR/local"; mkdir -p "$LOCAL_DIR"
 HOSTS_CSV="$LOCAL_DIR/hosts.csv"
 CREDS_FILE="$LOCAL_DIR/credentials.txt"
 FILES_DIR="$ROOT_DIR/files-to-copy"
-KNOWN_HOSTS="$LOCAL_DIR/known_hosts"
+KNOWN_HOSTS="$ROOT_DIR/known_hosts"
 
 # Dedicated per-project lab SSH identity (not tied to local user account)
 LAB_KEY="$LOCAL_DIR/lab_speed_ed25519"
@@ -20,20 +20,6 @@ LAB_PUB="$LOCAL_DIR/lab_speed_ed25519.pub"
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
-
-# Ensure per-project known_hosts lives under local/
-mkdir -p "$LOCAL_DIR"
-touch "$KNOWN_HOSTS" 2>/dev/null || true
-chmod 600 "$KNOWN_HOSTS" 2>/dev/null || true
-
-# Run summary counters (updated by per-host loops)
-KEY_OK=0; KEY_FAIL=0
-RSYNC_OK=0; RSYNC_FAIL=0
-PROMPT_OK=0; PROMPT_FAIL=0
-
-# Robust error capture (prevents silent exits under set -e)
-set -o errtrace
-trap 'rc=$?; echo "[ERR] rc=$rc line=$LINENO cmd=$BASH_COMMAND" >>"$LOG"; exit $rc' ERR
 
 MAG="\033[35m"; RST="\033[0m"
 C_CYAN="\033[36m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_RED="\033[31m"
@@ -65,18 +51,9 @@ progress_step() {
   empty=$(( width - filled ))
   bar_filled="$(printf '%*s' "$filled" '' | tr ' ' '#')"
   bar_empty="$(printf '%*s' "$empty" '' | tr ' ' '-')"
-
-  col="$C_CYAN"
-  if [ "$done" = "1" ]; then
-    col="$C_GRN"
-  fi
-
+  col="$C_CYAN"; [ "$done" = "1" ] && col="$C_GRN"
   printf "\r%b[%s%s]%b %s/%s %s%b" "$col" "$bar_filled" "$bar_empty" "$RST" "$cur" "$total" "$msg" "$RST"
-
-  if [ "$done" = "1" ]; then
-    printf "\n"
-  fi
-  return 0
+  [ "$done" = "1" ] && printf "\n"
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || return 1; }
@@ -97,43 +74,6 @@ ssh_opts() {
   # Always use the lab-speed key stored in local/ so any local user of this repo can use it for the lab duration.
   ensure_lab_key
   echo "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10 -i $LAB_KEY -o IdentitiesOnly=yes"
-}
-
-ssh_opts_keyonly() {
-  # Non-interactive: never prompt for password; fail fast if key isn't installed server-side.
-  # Uses the per-project lab key in local/.
-  echo "$(ssh_opts) -i $LAB_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no"
-}
-
-ssh_opts_interactive() {
-  # Interactive shells are allowed to prompt (used only for lab-connect).
-  echo "$(ssh_opts) -o PreferredAuthentications=publickey"
-}
-auth_check() {
-  # Returns 0 if key auth works; non-zero otherwise. Never prompts.
-  host="$1"
-  ssh $(ssh_opts_keyonly) -p 22 "$username@$host" "true" >/dev/null 2>&1
-  return $?
-}
-bootstrap_key_with_password() {
-  host="$1"; label="$2"
-  if ! need sshpass; then
-    return 127
-  fi
-  if [ -z "${SSHPASS:-}" ]; then
-    return 2
-  fi
-  # Use password auth once to install our lab public key into authorized_keys
-  export SSHPASS="$SSHPASS"
-  sshpass -e ssh $(ssh_opts) -p 22 "$username@$host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" < "$LAB_PUB" >/dev/null 2>&1
-  rc=$?
-  unset SSHPASS
-  if [ $rc -ne 0 ]; then
-    err "Password bootstrap failed for $host ($label)."
-    return 1
-  fi
-  ok "Key installed via password bootstrap on $host ($label)."
-  return 0
 }
 
 ensure_creds_file() {
@@ -174,20 +114,12 @@ sanitize_label() { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
 
 check_dependencies() {
   missing=0
-  pkgs=""
-
   echo
   echo "### Dependency check ###"
-  for cmd in ssh ssh-keygen rsync awk sed; do
+  for cmd in ssh rsync awk sed; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       echo "  MISSING: $cmd"
       missing=1
-      case "$cmd" in
-        ssh|ssh-keygen) pkgs="$pkgs openssh-client" ;;
-        rsync)          pkgs="$pkgs rsync" ;;
-        awk)            pkgs="$pkgs gawk" ;;
-        sed)            pkgs="$pkgs sed" ;;
-      esac
     else
       echo "  OK: $cmd"
     fi
@@ -195,10 +127,10 @@ check_dependencies() {
 
   if ! command -v sshpass >/dev/null 2>&1; then
     echo
-    echo "  OPTIONAL: sshpass"
-    echo "    (Only useful if the lab supports password authentication.)"
+    echo "  OPTIONAL (recommended): sshpass"
+    echo "    Used for first-run password bootstrap (ssh-key + rsync)"
     echo "    Install with:"
-    echo "      sudo apt-get update && sudo apt-get install -y sshpass"
+    echo "      sudo apt-get install -y sshpass"
   else
     echo "  OK: sshpass"
   fi
@@ -206,17 +138,13 @@ check_dependencies() {
   if [ "$missing" -eq 1 ]; then
     echo
     echo "One or more REQUIRED dependencies are missing."
-    echo "Install with:"
-    # de-dup package list (cheap uniq)
-    pkgs="$(printf "%s\n" $pkgs | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
-    echo "  If you have sudo:  sudo apt-get update && sudo apt-get install -y $pkgs"
-    echo "  If you do NOT have sudo: ask your lab/instructor/admin to install: $pkgs"
+    echo "Please install them before continuing."
     exit 1
   fi
   echo
 }
 
-# Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB). Uses function as display label (fallback LAB).
+# Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB).
 iter_hosts() {
   [ -f "$HOSTS_CSV" ] || die "hosts.csv not found: $HOSTS_CSV"
   awk '
@@ -260,7 +188,7 @@ validate_hosts() {
   while IFS='|' read -r ssh_host label; do
     n=$((n+1))
     [ -z "$ssh_host" ] && die "Invalid row $n (external-ip empty)"
-  done < <(iter_hosts || true)
+  done < <(iter_hosts)
   if [ "$n" -le 0 ]; then
     err "No hosts found in local/hosts.csv."
     err "Populate it with at least one row (comma OR tab separated) containing external-ip + function."
@@ -278,12 +206,13 @@ push_keys() {
 
   echo
   warn "Key-based auth required."
-  echo "Provide this public key to your lab admin/system to install for user '$username' (copy/paste it; do NOT run it as a command):"
+  echo "Provide this public key to your lab admin/system to install for user '$username':"
   echo
   sed 's/^/  /' "$LAB_PUB"
   echo
   warn "It should be added to: ~${username}/.ssh/authorized_keys"
   echo
+  read -rp "Press Enter to continue..."
   return 0
 }
 
@@ -299,28 +228,17 @@ copy_files() {
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] RSYNC -> $username@$ssh_host:/tmp/lab-speed/ ($lbl)"
 
-    # Fail fast if key is not installed server-side; never prompt for password.
-    ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "true" >/dev/null 2>&1
-    auth_rc=$?
-    if [ $auth_rc -ne 0 ]; then
-      failures=$((failures+1))
-      err "Key auth not yet enabled for $ssh_host ($lbl). Install the public key for user \"$username\" then re-run."
-      continue
-    fi
-
     set +e
-    ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "sh -c 'mkdir -p /tmp/lab-speed'" >/dev/null 2>&1
-    rsync -az -e "ssh $(ssh_opts_keyonly) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "sh -c 'mkdir -p /tmp/lab-speed'" >/dev/null 2>&1
+    rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
     rc=$?
     set -e
 
     if [ $rc -ne 0 ]; then
       failures=$((failures+1))
-      RSYNC_FAIL=$((RSYNC_FAIL+1))
-      err "RSYNC failed for $ssh_host ($lbl)." 
+      err "RSYNC failed for $ssh_host ($lbl)."
     else
-      RSYNC_OK=$((RSYNC_OK+1))
-      ok "RSYNC OK for $ssh_host ($lbl)." 
+      ok "RSYNC OK for $ssh_host ($lbl)."
     fi
   done < <(iter_hosts)
 
@@ -331,124 +249,55 @@ copy_files() {
 set_prompt() {
   check_prereqs
   ensure_creds
+  ensure_lab_key
   failures=0; i=0
   while IFS='|' read -r ssh_host label; do
     i=$((i+1))
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] Console setup (prompt) -> $username@$ssh_host ($lbl)"
     set +e
-    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "bash -lc '
-      set -e
-      # Ensure bash login shells source ~/.bashrc
-      bp=\"\$HOME/.bash_profile\"
-      touch \"\$bp\"
-      if ! grep -q \"lab-speed:source-bashrc\" \"\$bp\" 2>/dev/null; then
-        cat >> \"\$bp\" <<\"EOF\"
-# lab-speed:source-bashrc
-if [ -f ~/.bashrc ]; then
-  . ~/.bashrc
-fi
-EOF
-      fi
-
-      brc=\"\$HOME/.bashrc\"
-      touch \"\$brc\"
-
-      # Remove any existing lab-speed prompt block
-      if grep -q \"^# lab-speed:prompt-begin\" \"\$brc\" 2>/dev/null; then
-        awk \"BEGIN{p=1} /^# lab-speed:prompt-begin$/{p=0} /^# lab-speed:prompt-end$/{p=1;next} p\" \"\$brc\" > \"\$brc.tmp\" && mv \"\$brc.tmp\" \"\$brc\"
-      fi
-
-      # Append a robust prompt hook at the END (prevents later overrides)
-      cat >> \"\$brc\" <<\"EOF\"
-# lab-speed:prompt-begin
-# lab-speed prompt (auto-managed)
-__lab_speed_set_ps1() {
-  export PS1=\"[\\u@\\[\\e[30;42m\\]${lbl}\\[\\e[0m\\]\\h \\W]\\$ \"
-}
-case \"\$-\" in
-  *i*)
-    # Prepend our hook to PROMPT_COMMAND so it re-applies even if the lab image overwrites PS1
-    if [ -n \"\$PROMPT_COMMAND\" ]; then
-      PROMPT_COMMAND=\"__lab_speed_set_ps1; \$PROMPT_COMMAND\"
-    else
-      PROMPT_COMMAND=\"__lab_speed_set_ps1\"
-    fi
-    __lab_speed_set_ps1
-    ;;
-esac
-# lab-speed:prompt-end
-EOF
-    '" >/dev/null 2>&1
+    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "grep -q 'lab-speed:prompt' ~/.bash_profile 2>/dev/null || cat >> ~/.bash_profile <<'EOF'
+# lab-speed:prompt
+export PS1=\"[\\u@[$lbl]\\h \\W]\\$ \" 
+EOF" >/dev/null 2>&1
     rc=$?
     set -e
     if [ $rc -ne 0 ]; then
       failures=$((failures+1)); err "Prompt setup failed for $ssh_host ($lbl)."
     else
-      ok "Prompt set for $ssh_host ($lbl). (Open a NEW shell or run: source ~/.bashrc)"
+      ok "Prompt set for $ssh_host ($lbl)."
     fi
   done < <(iter_hosts)
   [ $failures -eq 0 ] || return 1
   return 0
 }
 
-
-
 show_hosts() {
-  header
   echo
   echo "---- local/hosts.csv ----"
-  if command -v less >/dev/null 2>&1; then
-    # Page the file for readability (q to quit)
-    sed 's/^/  /' "$HOSTS_CSV" | less -RSX
-  else
-    sed 's/^/  /' "$HOSTS_CSV"
-    echo "-------------------------"
-    echo
-    read -rp "Press Enter to continue..."
-  fi
+  sed 's/^/  /' "$HOSTS_CSV"
+  echo "-------------------------"
+  read -rp "Press Enter to continue..."
 }
-
 
 show_files_to_copy() {
-  header
   echo
   echo "---- files-to-copy/ ----"
-  if command -v less >/dev/null 2>&1; then
-    {
-      (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
-      echo
-      count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
-      size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
-      echo "  Files: $count    Size: ${size:-0}"
-      echo "------------------------"
-      echo
-      echo "  Tip: press 'q' to return."
-    } | less -RSX
-  else
-    (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
-    echo
-    count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
-    size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
-    echo "  Files: $count    Size: ${size:-0}"
-    echo "------------------------"
-    read -rp "Press Enter to continue..."
-  fi
+  (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
+  echo
+  count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
+  echo "  Files: $count    Size: ${size:-0}"
+  echo "------------------------"
+  read -rp "Press Enter to continue..."
 }
 
-
 go_fast_pipeline() {
-  # UI flow: avoid silent exits under 'set -e'
-  set +e
   ensure_lab_key
   total=4
 
   progress_step 1 "$total" "Validating hosts.csv" 0
-  set +e
-  validate_hosts
-  _vh_rc=$?
-  set -e
-  if [ "$_vh_rc" -ne 0 ]; then
+  if ! validate_hosts; then
     progress_step 1 "$total" "Validating hosts.csv" 1
     read -rp "Press Enter to return..." 
     return 1
@@ -466,21 +315,9 @@ go_fast_pipeline() {
   progress_step 4 "$total" "Console setup (prompt)" 0
   set_prompt || true
   progress_step 4 "$total" "Console setup (prompt)" 1
-  echo
-  echo "----------------------------------------"
-  info "Summary"
-  ok   "SSH keys:   ${KEY_OK} success, ${KEY_FAIL} failed"
-  ok   "RSYNC:      ${RSYNC_OK} host(s) updated, ${RSYNC_FAIL} failed"
-  ok   "Prompt:     ${PROMPT_OK} configured, ${PROMPT_FAIL} failed"
-  echo
-  info "Next steps:"
-  echo "  - Return to the main menu"
-  echo "  - Use option 2 (lab-connect) to SSH to your servers"
-  echo "----------------------------------------"
-  echo
-  read -rp "Press Enter to return to menu..." 
 
-  set -e
+  ok "GO! finished (see logs: $LOG)."
+  read -rp "Press Enter to return to menu..."
 }
 
 refresh_hosts_prompt() {
@@ -542,16 +379,7 @@ go_submenu() {
 
 open_ssh_window() {
   host="$1"; user="$2"
-
-  # lab-connect is intentionally password-first for speed.
-  # If sshpass is available and credentials are set, use it to avoid prompts.
-  # Otherwise fall back to normal ssh (user may be prompted).
-  if need sshpass && [ -f "$CREDS_FILE" ]; then
-    cmd="bash -lc 'set -e; . "$CREDS_FILE" >/dev/null 2>&1 || true; export SSHPASS="${SSHPASS:-}"; if [ -n "${SSHPASS:-}" ]; then sshpass -e ssh $(ssh_opts) -o PreferredAuthentications=password -o PubkeyAuthentication=no ${user}@${host}; else ssh $(ssh_opts) ${user}@${host}; fi'"
-  else
-    cmd="ssh $(ssh_opts) ${user}@${host}"
-  fi
-
+  cmd="ssh $(ssh_opts) ${user}@${host}"
   if command -v gnome-terminal >/dev/null 2>&1; then
     gnome-terminal -- bash -lc "$cmd; echo; echo 'Session ended.'; read -n1 -r -p 'Press any key to close...'"
     return 0
@@ -575,7 +403,6 @@ open_ssh_window() {
   warn "No supported terminal emulator found; running SSH in current terminal."
   exec $cmd
 }
-
 
 lab_connect_menu() {
   ensure_creds
@@ -648,7 +475,7 @@ print_menu() {
   echo "  2) SSH to the servers in our hosts file"
   echo
   echo "### Individual functions ###"
-  echo "  3) RSYNC distribute files to lab servers '/tmp' directory"
+  echo "  3) RSYNC distribute files to /tmp"
   echo "  4) Set ssh-keys (ssh-copy-id) to each host"
   echo "  5) Set ~/.bash_profile prompt from hosts.csv function"
   echo
@@ -675,9 +502,9 @@ main() {
     case "$c" in
       1) go_submenu ;;
       2) lab_connect_menu ;;
-      3) copy_files || true; read -rp "Press Enter..." ;;
-      4) push_keys || true; read -rp "Press Enter..." ;;
-      5) set_prompt || true; read -rp "Press Enter..." ;;
+      3) copy_files; read -rp "Press Enter..." ;;
+      4) push_keys; read -rp "Press Enter..." ;;
+      5) set_prompt; read -rp "Press Enter..." ;;
       6) show_hosts ;;
       7) cleanup_creds ;;
       q|Q) exit 0 ;;
