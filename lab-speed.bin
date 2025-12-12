@@ -339,6 +339,7 @@ option_cleanup() {
 show_menu() {
   clear || true
   cat <<'EOF'
+
 header() {
   clear
   printf "%b" "$MAG"
@@ -346,9 +347,10 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.9 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.0 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
+
 ### GO! - High Speed start ###
   1) GO! (install ssh key, RSYNC files to lab '/tmp', Console prompt)
 
