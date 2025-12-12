@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
 # Copyright (C) 2025 James Wintermute
-# Licensed under GNU GPLv3
+# Licensed under GNU GPLv3 (https://www.gnu.org/licenses/)
 # This program comes with ABSOLUTELY NO WARRANTY.
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -17,13 +17,8 @@ KNOWN_HOSTS="$ROOT_DIR/known_hosts"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 LOG="$LOG_DIR/lab-speed-$RUN_ID.log"
 
-# colours
-MAG="\033[35m"
-RST="\033[0m"
-C_CYAN="\033[36m"
-C_GRN="\033[32m"
-C_YEL="\033[33m"
-C_RED="\033[31m"
+MAG="\033[35m"; RST="\033[0m"
+C_CYAN="\033[36m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_RED="\033[31m"
 BOLD="\033[1m"
 
 log()  { printf "%b\n" "$*" | tee -a "$LOG" >/dev/null; }
@@ -44,27 +39,26 @@ header() {
   printf "%b\n" "$RST"
 }
 
-# step progress bar
 progress_step() {
   cur="$1"; total="$2"; msg="$3"; done="${4:-0}"
   width=24
   filled=$(( (cur * width) / total ))
-  [ "$filled" -lt 0 ] && filled=0
   [ "$filled" -gt "$width" ] && filled="$width"
   empty=$(( width - filled ))
   bar_filled="$(printf '%*s' "$filled" '' | tr ' ' '#')"
   bar_empty="$(printf '%*s' "$empty" '' | tr ' ' '-')"
-  col="$C_CYAN"
-  [ "$done" = "1" ] && col="$C_GRN"
+  col="$C_CYAN"; [ "$done" = "1" ] && col="$C_GRN"
   printf "\r%b[%s%s]%b %s/%s %s%b" "$col" "$bar_filled" "$bar_empty" "$RST" "$cur" "$total" "$msg" "$RST"
   [ "$done" = "1" ] && printf "\n"
 }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
-ssh_opts() { echo "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10"; }
-sh_quote() { printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"; }
+need() { command -v "$1" >/dev/null 2>&1 || return 1; }
 
-ensure_creds() {
+ssh_opts() {
+  echo "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10"
+}
+
+ensure_creds_file() {
   if [ ! -f "$CREDS_FILE" ]; then
     umask 077
     cat >"$CREDS_FILE" <<'EOF'
@@ -75,9 +69,12 @@ SSHPASS=""
 EOF
     chmod 600 "$CREDS_FILE" 2>/dev/null || true
   fi
+}
+
+ensure_creds() {
+  ensure_creds_file
   # shellcheck disable=SC1090
   . "$CREDS_FILE" || true
-
   if [ -z "${username:-}" ] || [ -z "${password:-}" ] || [ -z "${SSHPASS:-}" ]; then
     echo
     echo "Please enter the following credentials for your lab."
@@ -86,84 +83,233 @@ EOF
     read -rp "  username: " _u
     read -rsp "  password: " _p; echo
     read -rsp "  SSHPASS (press Enter to use same as password): " _s; echo
-    [ -z "$_s" ] && _s="$_p"
-
+    [ -z "${_s:-}" ] && _s="$_p"
     umask 077
     {
       echo "# lab-speed credentials (chmod 600)"
-      echo "username=$(sh_quote "$_u")"
-      echo "password=$(sh_quote "$_p")"
-      echo "SSHPASS=$(sh_quote "$_s")"
+      printf 'username="%s"\n' "$_u"
+      printf 'password="%s"\n' "$_p"
+      printf 'SSHPASS="%s"\n' "$_s"
     } >"$CREDS_FILE"
     chmod 600 "$CREDS_FILE" 2>/dev/null || true
-
     # shellcheck disable=SC1090
-    . "$CREDS_FILE"
+    . "$CREDS_FILE" || true
   fi
 }
 
-sanitize_label() { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
+sanitize_label()
 
-hosts_nonempty() {
-  # Returns 0 if at least one data row exists after header, else 1
-  [ -f "$HOSTS_CSV" ] || return 1
-  n="$(awk 'NR==1{next} /^[ \t]*$/ {next} /^[ \t]*#/ {next} {c++} END{print c+0}' "$HOSTS_CSV" 2>/dev/null || echo 0)"
-  [ "${n:-0}" -gt 0 ]
+
+check_dependencies() {
+  missing=0
+  echo
+  echo "### Dependency check ###"
+  for cmd in ssh rsync awk sed; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "  MISSING: $cmd"
+      missing=1
+    else
+      echo "  OK: $cmd"
+    fi
+  done
+
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo
+    echo "  OPTIONAL (recommended): sshpass"
+    echo "    Used for first-run password bootstrap (ssh-key + rsync)"
+    echo "    Install with:"
+    echo "      sudo apt-get install -y sshpass"
+  else
+    echo "  OK: sshpass"
+  fi
+
+  if [ "$missing" -eq 1 ]; then
+    echo
+    echo "One or more REQUIRED dependencies are missing."
+    echo "Please install them before continuing."
+    exit 1
+  fi
+  echo
 }
+ { echo "$1" | tr -cd 'A-Za-z0-9._-'; }
 
+# Supports comma OR tab separated hosts.csv. Uses function as display label (fallback LAB).
 iter_hosts() {
   [ -f "$HOSTS_CSV" ] || die "hosts.csv not found: $HOSTS_CSV"
   awk '
   function lcase(s) { return tolower(s) }
-  function trim(s)  { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
-  BEGIN { FS=","; OFS="|" }
-  NR==1 { for (i=1;i<=NF;i++) { h=trim(lcase($i)); idx[h]=i } ; next }
+  function trim(s)  { gsub(/\r/,"",s); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+  NR==1 {
+    delim = (index($0,"\t")>0 ? "\t" : ",")
+    n = split($0, h, delim)
+    for (i=1;i<=n;i++) { key=trim(lcase(h[i])); idx[key]=i }
+    next
+  }
   /^[ \t]*$/ { next }
   /^[ \t]*#/ { next }
   {
+    n = split($0, f, delim)
     ssh_host=""
-    if ("external-ip" in idx)      ssh_host=trim($(idx["external-ip"]))
-    else if ("external_ip" in idx) ssh_host=trim($(idx["external_ip"]))
-    else if ("host" in idx)        ssh_host=trim($(idx["host"]))
-    else if ("hostname" in idx)    ssh_host=trim($(idx["hostname"]))
-    else if ("ip" in idx)          ssh_host=trim($(idx["ip"]))
+    if (("external-ip" in idx) && idx["external-ip"]<=n) ssh_host=trim(f[idx["external-ip"]])
+    else if (("external_ip" in idx) && idx["external_ip"]<=n) ssh_host=trim(f[idx["external_ip"]])
     if (ssh_host=="") next
 
-    fn=""
-    if ("function" in idx) fn=trim($(idx["function"]))
-    else if ("role" in idx) fn=trim($(idx["role"]))
-    if (fn=="") fn="LAB"
-
-    print ssh_host, fn
+    label=""
+    if (("function" in idx) && idx["function"]<=n) label=trim(f[idx["function"]])
+    if (label=="") label="LAB"
+    print ssh_host "|" label
   }' "$HOSTS_CSV"
 }
 
-validate_hosts() {
-  hosts_nonempty || die "local/hosts.csv has only a header (no hosts). Please add your lab hosts first."
-  n=0
-  while IFS='|' read -r ssh_host fn; do
-    n=$((n+1))
-    [ -z "$ssh_host" ] && die "Invalid row $n (external-ip/host/ip empty)"
-  done < <(iter_hosts)
-  ok "hosts.csv OK ($n host(s))"
+hosts_count() {
+  c=0
+  while IFS='|' read -r _h _l; do c=$((c+1)); done < <(iter_hosts || true)
+  echo "$c"
 }
 
 check_prereqs() {
-  need ssh
-  need rsync
-  if ! command -v sshpass >/dev/null 2>&1; then
-    warn "sshpass not installed. Install: sudo apt-get install -y sshpass"
-  fi
+  need ssh || die "Missing dependency: ssh"
+  need rsync || die "Missing dependency: rsync"
 }
 
-push_keys() { check_prereqs; ensure_creds; :; }
-copy_files() { check_prereqs; ensure_creds; :; }
-set_prompt() { check_prereqs; ensure_creds; :; }
+validate_hosts() {
+  n=0
+  while IFS='|' read -r ssh_host label; do
+    n=$((n+1))
+    [ -z "$ssh_host" ] && die "Invalid row $n (external-ip empty)"
+  done < <(iter_hosts)
+  if [ "$n" -le 0 ]; then
+    err "No hosts found in local/hosts.csv."
+    err "Populate it with at least one row (comma OR tab separated) containing external-ip + function."
+    return 1
+  fi
+  ok "hosts.csv OK ($n host(s))"
+  return 0
+}
+
+# SSH key install: robust per-host (does not abort entire run)
+push_keys() {
+  check_prereqs
+  ensure_creds
+
+  if [ ! -f "$HOME/.ssh/id_ed25519.pub" ] && [ ! -f "$HOME/.ssh/id_rsa.pub" ]; then
+    info "Generating SSH key (ed25519)..."
+    ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" >/dev/null
+  fi
+
+  pub=""
+  if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then pub="$HOME/.ssh/id_ed25519.pub"; else pub="$HOME/.ssh/id_rsa.pub"; fi
+
+  failures=0; i=0
+  while IFS='|' read -r ssh_host label; do
+    i=$((i+1))
+    lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
+    info "[$i] Install key -> $username@$ssh_host ($lbl)"
+
+    set +e
+    if need sshpass; then
+      export SSHPASS="$SSHPASS"
+      sshpass -e ssh $(ssh_opts) -p 22 "$username@$ssh_host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh" >/dev/null 2>&1
+      rc1=$?
+      if [ $rc1 -eq 0 ]; then
+        sshpass -e ssh $(ssh_opts) -p 22 "$username@$ssh_host" "cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" < "$pub" >/dev/null 2>&1
+        rc2=$?
+      else
+        rc2=$rc1
+      fi
+      unset SSHPASS
+    else
+      if need ssh-copy-id; then
+        ssh-copy-id -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" "$username@$ssh_host" >/dev/null 2>&1
+        rc2=$?
+      else
+        err "Neither sshpass nor ssh-copy-id is installed; cannot copy keys."
+        rc2=127
+      fi
+    fi
+    set -e
+
+    if [ $rc2 -ne 0 ]; then
+      failures=$((failures+1))
+      err "Key install failed for $ssh_host ($lbl)."
+    else
+      ok "Key installed on $ssh_host ($lbl)."
+    fi
+  done < <(iter_hosts)
+
+  if [ $failures -gt 0 ]; then
+    warn "Key install completed with $failures failure(s). You can retry option 4."
+    return 1
+  fi
+  return 0
+}
+
+copy_files() {
+  check_prereqs
+  ensure_creds
+  [ -d "$FILES_DIR" ] || die "Missing: $FILES_DIR"
+
+  failures=0; i=0
+  while IFS='|' read -r ssh_host label; do
+    i=$((i+1))
+    lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
+    info "[$i] RSYNC -> $username@$ssh_host:/tmp/lab-speed/ ($lbl)"
+
+    set +e
+    if need sshpass; then
+      export SSHPASS="$SSHPASS"
+      sshpass -e ssh $(ssh_opts) -p 22 "$username@$ssh_host" "mkdir -p /tmp/lab-speed" >/dev/null 2>&1
+      rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+      rc=$?
+      unset SSHPASS
+    else
+      ssh $(ssh_opts) -p 22 "$username@$ssh_host" "mkdir -p /tmp/lab-speed" >/dev/null 2>&1
+      rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+      rc=$?
+    fi
+    set -e
+
+    if [ $rc -ne 0 ]; then
+      failures=$((failures+1))
+      err "RSYNC failed for $ssh_host ($lbl)."
+    else
+      ok "RSYNC OK for $ssh_host ($lbl)."
+    fi
+  done < <(iter_hosts)
+
+  [ $failures -eq 0 ] || return 1
+  return 0
+}
+
+set_prompt() {
+  check_prereqs
+  ensure_creds
+  failures=0; i=0
+  while IFS='|' read -r ssh_host label; do
+    i=$((i+1))
+    lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
+    info "[$i] Console setup (prompt) -> $username@$ssh_host ($lbl)"
+    set +e
+    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "grep -q 'lab-speed:prompt' ~/.bash_profile 2>/dev/null || cat >> ~/.bash_profile <<'EOF'
+# lab-speed:prompt
+export PS1=\"[\\u@[$lbl]\\h \\W]\\$ \" 
+EOF" >/dev/null 2>&1
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      failures=$((failures+1)); err "Prompt setup failed for $ssh_host ($lbl)."
+    else
+      ok "Prompt set for $ssh_host ($lbl)."
+    fi
+  done < <(iter_hosts)
+  [ $failures -eq 0 ] || return 1
+  return 0
+}
 
 show_hosts() {
   echo
   echo "---- local/hosts.csv ----"
-  sed 's/^/  /' "$HOSTS_CSV" 2>/dev/null || echo "  (missing $HOSTS_CSV)"
+  sed 's/^/  /' "$HOSTS_CSV"
   echo "-------------------------"
   read -rp "Press Enter to continue..."
 }
@@ -171,63 +317,74 @@ show_hosts() {
 show_files_to_copy() {
   echo
   echo "---- files-to-copy/ ----"
-  (ls -lah "$FILES_DIR" 2>/dev/null || echo "  (empty)") | sed 's/^/  /'
+  (ls -lah "$FILES_DIR" 2>/dev/null || true) | sed 's/^/  /'
+  echo
+  count="$(find "$FILES_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  size="$(du -sh "$FILES_DIR" 2>/dev/null | awk '{print $1}')"
+  echo "  Files: $count    Size: ${size:-0}"
   echo "------------------------"
   read -rp "Press Enter to continue..."
 }
 
 go_fast_pipeline() {
   total=4
+
   progress_step 1 "$total" "Validating hosts.csv" 0
-  validate_hosts
+  if ! validate_hosts; then
+    progress_step 1 "$total" "Validating hosts.csv" 1
+    read -rp "Press Enter to return..." 
+    return 1
+  fi
   progress_step 1 "$total" "Validating hosts.csv" 1
 
   progress_step 2 "$total" "Copying SSH keys" 0
-  push_keys
+  push_keys || true
   progress_step 2 "$total" "Copying SSH keys" 1
 
   progress_step 3 "$total" "RSYNC files to /tmp/lab-speed" 0
-  copy_files
+  copy_files || true
   progress_step 3 "$total" "RSYNC files to /tmp/lab-speed" 1
 
   progress_step 4 "$total" "Console setup (prompt)" 0
-  set_prompt
+  set_prompt || true
   progress_step 4 "$total" "Console setup (prompt)" 1
 
-  ok "GO! complete."
+  ok "GO! finished (see logs: $LOG)."
   read -rp "Press Enter to return to menu..."
 }
 
-go_submenu() {
-  # On entry, check hosts.csv has content
-  while ! hosts_nonempty; do
-    header
-    echo
-    warn "local/hosts.csv is empty (header only)."
-    echo
-    echo "Please populate: ${HOSTS_CSV}"
-    echo
-    echo "Options:"
-    echo "  s) Show hosts.csv"
-    echo "  r) Refresh hosts.csv (re-check)"
-    echo "  x) Back"
-    printf "Select an option: "
-    read -r k
-    case "$k" in
-      s|S) show_hosts ;;
-      r|R) : ;;  # loop repeats and re-checks
-      x|X) return 0 ;;
-      *) echo "Invalid option"; sleep 0.8 ;;
-    esac
-  done
+refresh_hosts_prompt() {
+  echo
+  echo "hosts.csv appears empty (only header or no valid rows)."
+  echo "Edit it now (another terminal / editor), then return."
+  read -rp "Press Enter to re-check hosts.csv..."
+}
 
+go_submenu() {
   while true; do
     header
+    if [ "$(hosts_count)" -eq 0 ]; then
+      printf "%b\n" "${C_YEL}WARNING:${RST} local/hosts.csv has no hosts configured."
+      echo
+      echo "  a) Show hosts.csv"
+      echo "  b) Refresh hosts.csv (after editing)"
+      echo
+      echo "  x) Back"
+      printf "Select an option: "
+      read -r s
+      case "$s" in
+        a|A) show_hosts ;;
+        b|B) refresh_hosts_prompt ;;
+        x|X) return 0 ;;
+        *) echo "Invalid option"; sleep 0.8 ;;
+      esac
+      continue
+    fi
+
     echo
     echo "### GO! Pre-flight checklist ###"
     echo "  a) Review files-to-copy (recommended)"
     echo "  b) Show hosts.csv"
-    echo "  r) Refresh hosts.csv"
     echo "  c) Start GO! (run all steps)"
     echo
     echo "  x) Back"
@@ -236,11 +393,10 @@ go_submenu() {
     case "$s" in
       a|A) show_files_to_copy ;;
       b|B) show_hosts ;;
-      r|R) : ;;
       c|C)
         echo
-        echo "${BOLD}Before we begin:${RST} please ensure everything you want copied is in:"
-        echo "  ${FILES_DIR}"
+        printf "%b\n" "${BOLD}Before we begin:${RST} ensure everything you want copied is in:"
+        echo "  $FILES_DIR"
         echo
         read -rp "Proceed with GO!? (y/N): " yn
         case "${yn:-N}" in
@@ -250,6 +406,88 @@ go_submenu() {
         ;;
       x|X) return 0 ;;
       *) echo "Invalid option"; sleep 0.8 ;;
+    esac
+  done
+}
+
+open_ssh_window() {
+  host="$1"; user="$2"
+  cmd="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10 ${user}@${host}"
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal -- bash -lc "$cmd; echo; echo 'Session ended.'; read -n1 -r -p 'Press any key to close...'"
+    return 0
+  fi
+  if command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -e bash -lc "$cmd; echo; read -n1 -r -p 'Press any key to close...'"
+    return 0
+  fi
+  if command -v konsole >/dev/null 2>&1; then
+    konsole -e bash -lc "$cmd; echo; read -n1 -r -p 'Press any key to close...'"
+    return 0
+  fi
+  if command -v xfce4-terminal >/dev/null 2>&1; then
+    xfce4-terminal --hold -e "$cmd"
+    return 0
+  fi
+  if command -v xterm >/dev/null 2>&1; then
+    xterm -e "$cmd"
+    return 0
+  fi
+  warn "No supported terminal emulator found; running SSH in current terminal."
+  exec $cmd
+}
+
+lab_connect_menu() {
+  ensure_creds
+  if [ "$(hosts_count)" -eq 0 ]; then
+    header
+    printf "%b\n" "${C_YEL}WARNING:${RST} local/hosts.csv has no hosts configured."
+    echo
+    echo "Please populate local/hosts.csv, then try again."
+    read -rp "Press Enter to return..."
+    return 0
+  fi
+
+  tmp="$LOG_DIR/lab-connect-$RUN_ID.list"
+  rm -f "$tmp" 2>/dev/null || true
+  while IFS='|' read -r h l; do
+    lbl="$(sanitize_label "$l")"
+    [ -z "$lbl" ] && lbl="LAB"
+    printf "%s|%s\n" "$lbl" "$h" >>"$tmp"
+  done < <(iter_hosts)
+  sort -t'|' -k1,1 "$tmp" | head -n 25 >"${tmp}.sorted"
+  mv "${tmp}.sorted" "$tmp"
+
+  while true; do
+    header
+    echo "### lab-connect (SSH to servers in your hosts file) ###"
+    echo
+    n=0
+    while IFS='|' read -r lbl h; do
+      n=$((n+1))
+      printf "  %2d) %s\n" "$n" "$lbl"
+    done < "$tmp"
+    echo
+    echo "   R) Return"
+    printf "Select a host: "
+    read -r choice
+    case "$choice" in
+      r|R) return 0 ;;
+      *)
+        if printf "%s" "$choice" | grep -Eq '^[0-9]+$'; then
+          idx="$choice"
+          if [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ]; then
+            echo "Invalid selection"; sleep 0.8; continue
+          fi
+          sel="$(sed -n "${idx}p" "$tmp")"
+          sel_lbl="${sel%%|*}"
+          sel_host="${sel#*|}"
+          info "Opening SSH window: $username@$sel_host ($sel_lbl)"
+          open_ssh_window "$sel_host" "$username"
+        else
+          echo "Invalid selection"; sleep 0.8
+        fi
+        ;;
     esac
   done
 }
@@ -265,16 +503,19 @@ print_menu() {
   echo "### GO! - High Speed start ###"
   echo "  1) Copy ssh-keys, RSYNC files to lab '/tmp', Console setup"
   echo
+  echo "### lab-connect ###"
+  echo "  2) SSH to the servers in our hosts file"
+  echo
   echo "### Individual functions ###"
-  echo "  2) RSYNC distribute files to /tmp"
-  echo "  3) Set ssh-keys (ssh-copy-id) to each host"
-  echo "  4) Set ~/.bash_profile prompt from hosts.csv function/role"
+  echo "  3) RSYNC distribute files to /tmp"
+  echo "  4) Set ssh-keys (ssh-copy-id) to each host"
+  echo "  5) Set ~/.bash_profile prompt from hosts.csv function"
   echo
   echo "### Inspection ###"
   echo "  6) Show hosts.csv"
   echo
   echo "### Clean-Up ###"
-  echo "  5) Clean Up, delete creds"
+  echo "  7) Clean Up, delete creds"
   echo
   echo "  q) Quit"
   printf "Select an option: "
@@ -282,20 +523,21 @@ print_menu() {
 
 main() {
   header
+  check_dependencies
   sleep 0.6
   ensure_creds
-
   while true; do
     header
     print_menu
     read -r c
     case "$c" in
       1) go_submenu ;;
-      2) copy_files; read -rp "Press Enter..." ;;
-      3) push_keys; read -rp "Press Enter..." ;;
-      4) set_prompt; read -rp "Press Enter..." ;;
-      5) cleanup_creds ;;
+      2) lab_connect_menu ;;
+      3) copy_files; read -rp "Press Enter..." ;;
+      4) push_keys; read -rp "Press Enter..." ;;
+      5) set_prompt; read -rp "Press Enter..." ;;
       6) show_hosts ;;
+      7) cleanup_creds ;;
       q|Q) exit 0 ;;
       *) warn "Invalid option"; sleep 0.8 ;;
     esac
@@ -303,3 +545,76 @@ main() {
 }
 
 main
+
+set_prompt() {{
+  check_prereqs
+  ensure_creds
+  failures=0; i=0
+  while IFS='|' read -r ssh_host label; do
+    i=$((i+1))
+    func="$(sanitize_label "$label")"; [ -z "$func" ] && func="LAB"
+    info "[$i] Console setup (prompt) -> $username@$ssh_host ($func)"
+    set +e
+    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "bash -lc '
+      set -e
+      f=\"$HOME/.bash_profile\"
+      touch \"$f\"
+      # Remove any existing lab-speed prompt block
+      if grep -q \"^# lab-speed:prompt-begin\" \"$f\" 2>/dev/null; then
+        awk \"BEGIN{{p=1}} /^# lab-speed:prompt-begin$/{{p=0}} /^# lab-speed:prompt-end$/{{p=1;next}} p\" \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"
+      fi
+      cat >> \"$f\" <<\"EOF\"
+# lab-speed:prompt-begin
+# lab-speed prompt (auto-managed)
+export PS1=\"[\\u@\\[\\e[30;42m\\]${func}\\[\\e[0m\\]\\h \\W]\\$ \"
+# lab-speed:prompt-end
+EOF
+    '" >/dev/null 2>&1
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      failures=$((failures+1)); err "Prompt setup failed for $ssh_host ($func)."
+    else
+      ok "Prompt set for $ssh_host ($func). (New shells will pick it up; run: source ~/.bash_profile)"
+    fi
+  done < <(iter_hosts)
+  [ $failures -eq 0 ] || return 1
+  return 0
+}}
+
+copy_files() {{
+  check_prereqs
+  ensure_creds
+  [ -d "$FILES_DIR" ] || die "Missing: $FILES_DIR"
+
+  failures=0; i=0
+  while IFS='|' read -r ssh_host label; do
+    i=$((i+1))
+    func="$(sanitize_label "$label")"; [ -z "$func" ] && func="LAB"
+    info "[$i] RSYNC -> $username@$ssh_host:/tmp/lab-speed/ ($func)"
+
+    set +e
+    if need sshpass; then
+      export SSHPASS="$SSHPASS"
+      sshpass -e ssh $(ssh_opts) -p 22 "$username@$ssh_host" "mkdir -p /tmp/lab-speed" >/dev/null 2>&1
+      sshpass -e rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+      rc=$?
+      unset SSHPASS
+    else
+      ssh $(ssh_opts) -p 22 "$username@$ssh_host" "mkdir -p /tmp/lab-speed" >/dev/null 2>&1
+      rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+      rc=$?
+    fi
+    set -e
+
+    if [ $rc -ne 0 ]; then
+      failures=$((failures+1))
+      err "RSYNC failed for $ssh_host ($func)."
+    else
+      ok "RSYNC OK for $ssh_host ($func)."
+    fi
+  done < <(iter_hosts)
+
+  [ $failures -eq 0 ] || return 1
+  return 0
+}}
