@@ -39,7 +39,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.0.1 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.0 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
 
@@ -188,7 +188,7 @@ validate_hosts() {
   while IFS='|' read -r ssh_host label; do
     n=$((n+1))
     [ -z "$ssh_host" ] && die "Invalid row $n (external-ip empty)"
-  done < <(iter_hosts)
+  done < <(iter_hosts || true)
   if [ "$n" -le 0 ]; then
     err "No hosts found in local/hosts.csv."
     err "Populate it with at least one row (comma OR tab separated) containing external-ip + function."
