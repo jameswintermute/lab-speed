@@ -43,7 +43,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.0 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.1 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
 
@@ -55,9 +55,18 @@ progress_step() {
   empty=$(( width - filled ))
   bar_filled="$(printf '%*s' "$filled" '' | tr ' ' '#')"
   bar_empty="$(printf '%*s' "$empty" '' | tr ' ' '-')"
-  col="$C_CYAN"; [ "$done" = "1" ] && col="$C_GRN"
+
+  col="$C_CYAN"
+  if [ "$done" = "1" ]; then
+    col="$C_GRN"
+  fi
+
   printf "\r%b[%s%s]%b %s/%s %s%b" "$col" "$bar_filled" "$bar_empty" "$RST" "$cur" "$total" "$msg" "$RST"
-  [ "$done" = "1" ] && printf "\n"
+
+  if [ "$done" = "1" ]; then
+    printf "\n"
+  fi
+  return 0
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || return 1; }
@@ -78,6 +87,16 @@ ssh_opts() {
   # Always use the lab-speed key stored in local/ so any local user of this repo can use it for the lab duration.
   ensure_lab_key
   echo "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10 -i $LAB_KEY -o IdentitiesOnly=yes"
+}
+
+ssh_opts_keyonly() {
+  # Non-interactive: never prompt for password; fail fast if key isn't installed server-side.
+  echo "$(ssh_opts) -o BatchMode=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no"
+}
+
+ssh_opts_interactive() {
+  # Interactive shells are allowed to prompt (used only for lab-connect).
+  echo "$(ssh_opts) -o PreferredAuthentications=publickey"
 }
 
 ensure_creds_file() {
@@ -153,7 +172,8 @@ check_dependencies() {
     echo "Install with:"
     # de-dup package list (cheap uniq)
     pkgs="$(printf "%s\n" $pkgs | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')"
-    echo "  sudo apt-get update && sudo apt-get install -y $pkgs"
+    echo "  If you have sudo:  sudo apt-get update && sudo apt-get install -y $pkgs"
+    echo "  If you do NOT have sudo: ask your lab/instructor/admin to install: $pkgs"
     exit 1
   fi
   echo
@@ -221,7 +241,7 @@ push_keys() {
 
   echo
   warn "Key-based auth required."
-  echo "Provide this public key to your lab admin/system to install for user '$username':"
+  echo "Provide this public key to your lab admin/system to install for user '$username' (copy/paste it; do NOT run it as a command):"
   echo
   sed 's/^/  /' "$LAB_PUB"
   echo
@@ -243,9 +263,18 @@ copy_files() {
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] RSYNC -> $username@$ssh_host:/tmp/lab-speed/ ($lbl)"
 
+    # Fail fast if key is not installed server-side; never prompt for password.
+    ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "true" >/dev/null 2>&1
+    auth_rc=$?
+    if [ $auth_rc -ne 0 ]; then
+      failures=$((failures+1))
+      err "Key auth not yet enabled for $ssh_host ($lbl). Install the public key for user \"$username\" then re-run."
+      continue
+    fi
+
     set +e
-    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "sh -c 'mkdir -p /tmp/lab-speed'" >/dev/null 2>&1
-    rsync -az -e "ssh $(ssh_opts) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
+    ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "sh -c 'mkdir -p /tmp/lab-speed'" >/dev/null 2>&1
+    rsync -az -e "ssh $(ssh_opts_keyonly) -p 22" "$FILES_DIR/" "$username@$ssh_host:/tmp/lab-speed/" >/dev/null 2>&1
     rc=$?
     set -e
 
@@ -271,7 +300,7 @@ set_prompt() {
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] Console setup (prompt) -> $username@$ssh_host ($lbl)"
     set +e
-    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "grep -q 'lab-speed:prompt' ~/.bash_profile 2>/dev/null || cat >> ~/.bash_profile <<'EOF'
+    ssh $(ssh_opts_keyonly) -p 22 "$username@$ssh_host" "grep -q 'lab-speed:prompt' ~/.bash_profile 2>/dev/null || cat >> ~/.bash_profile <<'EOF'
 # lab-speed:prompt
 export PS1=\"[\\u@[$lbl]\\h \\W]\\$ \" 
 EOF" >/dev/null 2>&1
@@ -401,7 +430,7 @@ go_submenu() {
 
 open_ssh_window() {
   host="$1"; user="$2"
-  cmd="ssh $(ssh_opts) ${user}@${host}"
+  cmd="ssh $(ssh_opts_interactive) ${user}@${host}"
   if command -v gnome-terminal >/dev/null 2>&1; then
     gnome-terminal -- bash -lc "$cmd; echo; echo 'Session ended.'; read -n1 -r -p 'Press any key to close...'"
     return 0
