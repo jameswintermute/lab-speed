@@ -53,7 +53,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.6 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.7 - Dec 2025. James Wintermute"
   printf "%b\n" "$RST"
 }
 
@@ -337,42 +337,61 @@ set_prompt() {
     lbl="$(sanitize_label "$label")"; [ -z "$lbl" ] && lbl="LAB"
     info "[$i] Console setup (prompt) -> $username@$ssh_host ($lbl)"
     set +e
-
-    # Write prompt into ~/.bashrc (most lab shells source this). Also ensure ~/.bash_profile sources ~/.bashrc.
-    ssh $(ssh_opts) -p 22 -i "$LAB_KEY" -o IdentitiesOnly=yes "$username@$ssh_host" "bash -lc '
+    ssh $(ssh_opts) -p 22 "$username@$ssh_host" "bash -lc '
       set -e
-      b=\"\$HOME/.bashrc\"
-      p=\"\$HOME/.bash_profile\"
-      touch \"\$b\" \"\$p\"
-      # Ensure bash_profile sources bashrc (safe if repeated)
-      grep -q \"lab-speed:source-bashrc\" \"\$p\" 2>/dev/null || cat >> \"\$p\" <<\"EOF\"
+      # Ensure bash login shells source ~/.bashrc
+      bp=\"\$HOME/.bash_profile\"
+      touch \"\$bp\"
+      if ! grep -q \"lab-speed:source-bashrc\" \"\$bp\" 2>/dev/null; then
+        cat >> \"\$bp\" <<\"EOF\"
 # lab-speed:source-bashrc
-if [ -f \"\$HOME/.bashrc\" ]; then
-  . \"\$HOME/.bashrc\"
+if [ -f ~/.bashrc ]; then
+  . ~/.bashrc
 fi
 EOF
-      # Remove any existing lab-speed prompt block in bashrc
-      if grep -q \"^# lab-speed:prompt-begin\" \"\$b\" 2>/dev/null; then
-        awk \"BEGIN{p=1} /^# lab-speed:prompt-begin$/{p=0} /^# lab-speed:prompt-end$/{p=1;next} p\" \"\$b\" > \"\$b.tmp\" && mv \"\$b.tmp\" \"\$b\"
       fi
-      cat >> \"\$b\" <<\"EOF\"
+
+      brc=\"\$HOME/.bashrc\"
+      touch \"\$brc\"
+
+      # Remove any existing lab-speed prompt block
+      if grep -q \"^# lab-speed:prompt-begin\" \"\$brc\" 2>/dev/null; then
+        awk \"BEGIN{p=1} /^# lab-speed:prompt-begin$/{p=0} /^# lab-speed:prompt-end$/{p=1;next} p\" \"\$brc\" > \"\$brc.tmp\" && mv \"\$brc.tmp\" \"\$brc\"
+      fi
+
+      # Append a robust prompt hook at the END (prevents later overrides)
+      cat >> \"\$brc\" <<\"EOF\"
 # lab-speed:prompt-begin
 # lab-speed prompt (auto-managed)
-export PS1=\"[\u@\[\e[30;42m\]$lbl\[\e[0m\]\h \W]\$ \"
+__lab_speed_set_ps1() {
+  export PS1=\"[\\u@\\[\\e[30;42m\\]${lbl}\\[\\e[0m\\]\\h \\W]\\$ \"
+}
+case \"\$-\" in
+  *i*)
+    # Prepend our hook to PROMPT_COMMAND so it re-applies even if the lab image overwrites PS1
+    if [ -n \"\$PROMPT_COMMAND\" ]; then
+      PROMPT_COMMAND=\"__lab_speed_set_ps1; \$PROMPT_COMMAND\"
+    else
+      PROMPT_COMMAND=\"__lab_speed_set_ps1\"
+    fi
+    __lab_speed_set_ps1
+    ;;
+esac
 # lab-speed:prompt-end
 EOF
     '" >/dev/null 2>&1
     rc=$?
     set -e
     if [ $rc -ne 0 ]; then
-      failures=$((failures+1)); PROMPT_FAIL=$((PROMPT_FAIL+1)); err "Prompt setup failed for $ssh_host ($lbl)."
+      failures=$((failures+1)); err "Prompt setup failed for $ssh_host ($lbl)."
     else
-      PROMPT_OK=$((PROMPT_OK+1)); ok "Prompt set for $ssh_host ($lbl). (Open a new shell, or run: source ~/.bashrc)"
+      ok "Prompt set for $ssh_host ($lbl). (Open a NEW shell or run: source ~/.bashrc)"
     fi
   done < <(iter_hosts)
   [ $failures -eq 0 ] || return 1
   return 0
 }
+
 
 
 show_hosts() {
