@@ -29,6 +29,15 @@ REMOTE_DIR="/tmp/lab-speed"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-7}"
 CONNECT_CHECK_TIMEOUT="${CONNECT_CHECK_TIMEOUT:-5}"
 
+# NEW: default SSH username when hosts.csv has no user column
+SSH_USER_DEFAULT="${SSH_USER_DEFAULT:-ubuntu}"
+
+# NEW: logs
+LOGS_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOGS_DIR"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+RUN_LOG="$LOGS_DIR/lab-speed-$RUN_ID.log"
+
 # ───────────────────────── UI / Colors ─────────────────────────
 if [[ -t 1 ]]; then
   CLR_MAG=$'\e[35m'
@@ -55,14 +64,15 @@ header() {
 }
 
 # ───────────────────────── Logging ─────────────────────────
-log_info() { echo "${CLR_CYN}[INFO]${CLR_RST} $*"; }
-log_ok()   { echo "${CLR_GRN}[OK]${CLR_RST}   $*"; }
-log_warn() { echo "${CLR_YEL}[WARN]${CLR_RST} $*"; }
-log_err()  { echo "${CLR_RED}[ERROR]${CLR_RST} $*"; }
+log_info() { echo "${CLR_CYN}[INFO]${CLR_RST} $*" | tee -a "$RUN_LOG" >/dev/null; }
+log_ok()   { echo "${CLR_GRN}[OK]${CLR_RST}   $*" | tee -a "$RUN_LOG" >/dev/null; }
+log_warn() { echo "${CLR_YEL}[WARN]${CLR_RST} $*" | tee -a "$RUN_LOG" >/dev/null; }
+log_err()  { echo "${CLR_RED}[ERROR]${CLR_RST} $*" | tee -a "$RUN_LOG" >/dev/null; }
+
+log_file() { log_info "Run log: $RUN_LOG"; }
 
 # ───────────────────────── Path resolution ─────────────────────────
 resolve_file_any() {
-  # usage: resolve_file_any "name1" "name2" ...
   local n
   for n in "$@"; do
     if [[ -f "$SCRIPT_DIR/$n" ]]; then printf "%s" "$SCRIPT_DIR/$n"; return 0; fi
@@ -108,6 +118,7 @@ on_err() {
   local ec=$?
   echo
   log_err "lab-speed failed (exit=$ec) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  log_file
   echo
   return "$ec"
 }
@@ -116,21 +127,14 @@ trap on_err ERR
 pause() { echo; read -r -p "Press Enter to return to menu..." _ || true; }
 
 trim() { echo "${1:-}" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
-
-# strip scheme/path so "https://host/path" becomes "host"
 clean_host() { echo "${1:-}" | sed -e 's#^[a-zA-Z]\+://##' -e 's#/.*$##'; }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { log_warn "Missing dependency: $1"; return 1; }
-}
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { log_warn "Missing dependency: $1"; return 1; }; }
 
 check_dependencies() {
   local missing=0
-  for c in bash awk sed ssh rsync; do
-    require_cmd "$c" || missing=1
-  done
+  for c in bash awk sed ssh rsync; do require_cmd "$c" || missing=1; done
   require_cmd sshpass || missing=1
-  # timeout improves connectivity checks but is optional
   command -v timeout >/dev/null 2>&1 || true
   if [[ "$missing" -ne 0 ]]; then
     echo
@@ -146,18 +150,9 @@ dependency_status() {
   log_info "Dependency check:"
   local c ok=1
   for c in bash awk sed ssh rsync sshpass; do
-    if command -v "$c" >/dev/null 2>&1; then
-      log_ok "  $c"
-    else
-      log_warn "  $c (missing)"
-      ok=0
-    fi
+    if command -v "$c" >/dev/null 2>&1; then log_ok "  $c"; else log_warn "  $c (missing)"; ok=0; fi
   done
-  if command -v timeout >/dev/null 2>&1; then
-    log_ok "  timeout (optional)"
-  else
-    log_info "  timeout (optional, not installed)"
-  fi
+  if command -v timeout >/dev/null 2>&1; then log_ok "  timeout (optional)"; else log_info "  timeout (optional, not installed)"; fi
   echo
   return $(( ok==1 ? 0 : 1 ))
 }
@@ -170,7 +165,6 @@ validate_layout() {
     log_warn "  $LOCAL_DIR/hosts.csv"
     bad=1
   fi
-
   if [[ -z "${CREDS_FILE:-}" || ! -f "$CREDS_FILE" ]]; then
     log_warn "credentials file not found. Expected one of:"
     log_warn "  $SCRIPT_DIR/creds.txt"
@@ -179,7 +173,6 @@ validate_layout() {
     log_warn "  $LOCAL_DIR/credentials.txt"
     bad=1
   fi
-
   if [[ ! -d "$FILES_DIR" ]]; then
     log_warn "files-to-copy directory not found: $FILES_DIR"
     bad=1
@@ -188,19 +181,15 @@ validate_layout() {
 }
 
 read_password() {
-  # Supports:
-  # - first non-empty line is password
-  # - SSH_PASS=..., PASSWORD=...
   local line pass
   [[ -f "$CREDS_FILE" ]] || { log_warn "credentials file missing: $CREDS_FILE"; return 1; }
   line="$(grep -m1 -v '^[[:space:]]*$' "$CREDS_FILE" 2>/dev/null | tr -d '\r' || true)"
   line="$(trim "$line")"
   [[ -n "$line" ]] || { log_warn "credentials file is empty: $CREDS_FILE"; return 1; }
-
   case "$line" in
     SSH_PASS=*) pass="${line#SSH_PASS=}" ;;
     PASSWORD=*) pass="${line#PASSWORD=}" ;;
-    *)          pass="$line" ;;
+    *) pass="$line" ;;
   esac
   pass="$(trim "$pass")"
   [[ -n "$pass" ]] || { log_warn "could not parse password from $CREDS_FILE"; return 1; }
@@ -209,56 +198,34 @@ read_password() {
 
 PASS_CACHE=""
 ensure_password() {
-  if [[ -n "${PASS_CACHE:-}" ]]; then
-    return 0
-  fi
-
+  if [[ -n "${PASS_CACHE:-}" ]]; then return 0; fi
   local pass=""
   pass="$(read_password 2>/dev/null || true)"
   pass="$(trim "$pass")"
-
-  if [[ -n "$pass" ]]; then
-    PASS_CACHE="$pass"
-    return 0
-  fi
+  if [[ -n "$pass" ]]; then PASS_CACHE="$pass"; return 0; fi
 
   echo
   log_warn "No SSH password found in credentials file."
-  if [[ -z "${CREDS_FILE:-}" ]]; then
-    CREDS_FILE="$LOCAL_DIR/credentials.txt"
-  fi
-
+  [[ -z "${CREDS_FILE:-}" ]] && CREDS_FILE="$LOCAL_DIR/credentials.txt"
   read -r -s -p "Enter SSH password (will not echo): " pass || true
   echo
   pass="$(trim "$pass")"
-  if [[ -z "$pass" ]]; then
-    log_err "Password not provided. Aborting this action."
-    return 1
-  fi
-
+  if [[ -z "$pass" ]]; then log_err "Password not provided. Aborting this action."; return 1; fi
   read -r -p "Save password to $(basename "$CREDS_FILE") for this repo? (Y/n): " ans || true
   case "${ans:-Y}" in
-    n|N)
-      log_info "Password will be used for this run only."
-      ;;
-    *)
-      mkdir -p "$(dirname "$CREDS_FILE")" 2>/dev/null || true
-      printf "%s\n" "SSH_PASS=$pass" > "$CREDS_FILE"
-      chmod 600 "$CREDS_FILE" 2>/dev/null || true
-      log_ok "Saved credentials to $CREDS_FILE"
-      ;;
+    n|N) log_info "Password will be used for this run only." ;;
+    *) mkdir -p "$(dirname "$CREDS_FILE")" 2>/dev/null || true
+       printf "%s\n" "SSH_PASS=$pass" > "$CREDS_FILE"
+       chmod 600 "$CREDS_FILE" 2>/dev/null || true
+       log_ok "Saved credentials to $CREDS_FILE"
+       ;;
   esac
-
   PASS_CACHE="$pass"
   return 0
 }
 
 read_hosts() {
-  # Backwards-compat:
-  #   Old: host,user,function
-  #   New: host-url,external-ip,internal-ip,function   (optionally + ,user as 5th column)
-  #
-  # Output stays: host_or_ip,user,function
+  # Output: target,user,function
   awk -F',' '
     function trim(s){ sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
     function clean(s){
@@ -271,7 +238,8 @@ read_hosts() {
     /^[ \t\r]*#/ { next }
     {
       c1=tolower(trim($1));
-      if (c1 ~ /^host(url)?$/ || c1 ~ /^hostname$/) next
+      # skip header rows (support host-url)
+      if (c1=="host" || c1=="hostname" || c1=="hosturl" || c1=="host-url" || c1=="host_url") next
 
       if (NF >= 4) {
         hosturl = clean($1);
@@ -291,7 +259,9 @@ read_hosts() {
 
 ssh_target() {
   local host="$1" user="$2"
-  if [[ -n "${user:-}" ]]; then printf "%s@%s" "$user" "$host"; else printf "%s" "$host"; fi
+  user="$(trim "${user:-}")"
+  if [[ -z "$user" ]]; then user="$SSH_USER_DEFAULT"; fi
+  printf "%s@%s" "$user" "$host"
 }
 
 progress_bar() {
@@ -305,20 +275,13 @@ progress_bar() {
   printf "\r[%s] %d/%d hosts checked OK — %s" "$bar" "$ok" "$total" "$label"
 }
 
-# Connectivity probe:
-# - Prefer key-based check (BatchMode) (works if password auth disabled)
-# - Fallback to password check (sshpass)
 probe_host_ok() {
   local target="$1" pass="$2"
-
-  # 1) key-based (no prompts)
   if command -v timeout >/dev/null 2>&1; then
     timeout "${CONNECT_CHECK_TIMEOUT}"s ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o PreferredAuthentications=publickey "$target" "true" >/dev/null 2>&1 && return 0
   else
     ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o PreferredAuthentications=publickey "$target" "true" >/dev/null 2>&1 && return 0
   fi
-
-  # 2) password-based (if sshpass available and we have a pass)
   if command -v sshpass >/dev/null 2>&1 && [[ -n "${pass:-}" ]]; then
     if command -v timeout >/dev/null 2>&1; then
       SSHPASS="$pass" timeout "${CONNECT_CHECK_TIMEOUT}"s sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no "$target" "true" >/dev/null 2>&1 && return 0
@@ -326,7 +289,6 @@ probe_host_ok() {
       SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no "$target" "true" >/dev/null 2>&1 && return 0
     fi
   fi
-
   return 1
 }
 
@@ -339,13 +301,14 @@ step_validate() {
     log_warn "No usable hosts found in $HOSTS_CSV"
     return 1
   fi
-  ensure_password || true  # do not hard-fail validation if you prefer key-only labs
-
+  ensure_password || true
   log_ok "Inputs validated."
   log_ok "hosts.csv: $HOSTS_CSV"
   log_ok "creds    : $CREDS_FILE"
   log_ok "knownhost: $KNOWN_HOSTS_FILE"
+  log_ok "ssh user : $SSH_USER_DEFAULT (default)"
   [[ -n "${SSH_KEY:-}" ]] && log_ok "ssh key  : $SSH_KEY"
+  log_file
   return 0
 }
 
@@ -359,11 +322,7 @@ step_connectivity_check() {
   total="${#lines[@]}"
   okcount=0
   done=0
-
-  if [[ "$total" -eq 0 ]]; then
-    log_warn "No hosts to check."
-    return 1
-  fi
+  [[ "$total" -eq 0 ]] && { log_warn "No hosts to check."; return 1; }
 
   local line host user func target label
   for line in "${lines[@]}"; do
@@ -372,15 +331,10 @@ step_connectivity_check() {
     func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
     target="$(ssh_target "$host" "$user")"
     label="${target}${func:+ ($func)}"
-
-    if probe_host_ok "$target" "$pass"; then
-      okcount=$((okcount+1))
-    fi
-
+    if probe_host_ok "$target" "$pass"; then okcount=$((okcount+1)); fi
     done=$((done+1))
     progress_bar "$okcount" "$done" "$total" "$label"
   done
-
   echo
   if [[ "$okcount" -eq "$total" ]]; then
     log_ok "Connectivity OK: ${okcount}/${total} hosts reachable."
@@ -405,6 +359,9 @@ step_install_ssh_key() {
     fi
   fi
 
+  local keyopt=()
+  [[ -n "${SSH_KEY_PUB:-}" && -f "$SSH_KEY_PUB" ]] && keyopt=( -i "$SSH_KEY_PUB" )
+
   local line host user func target
   while IFS= read -r line; do
     host="$(trim "${line%%,*}")"
@@ -413,14 +370,11 @@ step_install_ssh_key() {
     target="$(ssh_target "$host" "$user")"
 
     log_info "ssh-copy-id -> $target ${func:+(function=$func)}"
-    if [[ -n "${SSH_KEY_PUB:-}" && -f "$SSH_KEY_PUB" ]]; then
-      sshpass -p "$pass" ssh-copy-id -i "$SSH_KEY_PUB" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$target" >/dev/null 2>&1 \
-        && log_ok "Key installed on $target" \
-        || log_warn "Key install failed on $target (continuing)"
+    # Capture output to log for troubleshooting
+    if sshpass -p "$pass" ssh-copy-id "${keyopt[@]}" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$target" >>"$RUN_LOG" 2>&1; then
+      log_ok "Key installed on $target"
     else
-      sshpass -p "$pass" ssh-copy-id -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$target" >/dev/null 2>&1 \
-        && log_ok "Key installed on $target" \
-        || log_warn "Key install failed on $target (continuing)"
+      log_warn "Key install failed on $target (see log: $RUN_LOG)"
     fi
   done < <(read_hosts)
 
@@ -441,20 +395,23 @@ step_rsync_files() {
 
     log_info "Preparing $target ${func:+(function=$func)}"
     if [[ -n "$pass" ]]; then
-      SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target" "mkdir -p '$REMOTE_DIR'" >/dev/null 2>&1 \
-        || { log_warn "Failed to create $REMOTE_DIR on $target (continuing)"; continue; }
+      if ! SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target" "mkdir -p '$REMOTE_DIR'" >>"$RUN_LOG" 2>&1; then
+        log_warn "Failed to create $REMOTE_DIR on $target (continuing)"
+        continue
+      fi
       log_info "RSYNC -> $target:$REMOTE_DIR"
-      SSHPASS="$pass" sshpass -e rsync -az --delete --timeout=20 -e "ssh ${SSH_OPTS[*]}" "$FILES_DIR/" "$target:$REMOTE_DIR/" \
+      SSHPASS="$pass" sshpass -e rsync -az --delete --timeout=20 -e "ssh ${SSH_OPTS[*]}" "$FILES_DIR/" "$target:$REMOTE_DIR/" >>"$RUN_LOG" 2>&1 \
         && log_ok "Synced to $target" \
-        || log_warn "RSYNC failed on $target (continuing)"
+        || log_warn "RSYNC failed on $target (see log)"
     else
-      # key-based path (no sshpass)
-      ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$target" "mkdir -p '$REMOTE_DIR'" >/dev/null 2>&1 \
-        || { log_warn "Failed to create $REMOTE_DIR on $target (continuing)"; continue; }
+      if ! ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$target" "mkdir -p '$REMOTE_DIR'" >>"$RUN_LOG" 2>&1; then
+        log_warn "Failed to create $REMOTE_DIR on $target (continuing)"
+        continue
+      fi
       log_info "RSYNC -> $target:$REMOTE_DIR"
-      rsync -az --delete --timeout=20 -e "ssh ${SSH_OPTS[*]} -o BatchMode=yes" "$FILES_DIR/" "$target:$REMOTE_DIR/" \
+      rsync -az --delete --timeout=20 -e "ssh ${SSH_OPTS[*]} -o BatchMode=yes" "$FILES_DIR/" "$target:$REMOTE_DIR/" >>"$RUN_LOG" 2>&1 \
         && log_ok "Synced to $target" \
-        || log_warn "RSYNC failed on $target (continuing)"
+        || log_warn "RSYNC failed on $target (see log)"
     fi
   done < <(read_hosts)
 
@@ -497,9 +454,9 @@ step_set_prompt() {
           echo \"\$END\"
         } >> \"\$tmp\"
         mv \"\$tmp\" \"\$PROFILE\"
-      '" >/dev/null 2>&1 \
+      '" >>"$RUN_LOG" 2>&1 \
         && log_ok "Prompt set on $target" \
-        || log_warn "Prompt update failed on $target (continuing)"
+        || log_warn "Prompt update failed on $target (see log)"
     else
       ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$target" "bash -lc '
         set -e
@@ -521,9 +478,9 @@ step_set_prompt() {
           echo \"\$END\"
         } >> \"\$tmp\"
         mv \"\$tmp\" \"\$PROFILE\"
-      '" >/dev/null 2>&1 \
+      '" >>"$RUN_LOG" 2>&1 \
         && log_ok "Prompt set on $target" \
-        || log_warn "Prompt update failed on $target (continuing)"
+        || log_warn "Prompt update failed on $target (see log)"
     fi
   done < <(read_hosts)
 
@@ -553,7 +510,7 @@ option_ssh() {
     user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
     func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
     hosts+=("$host"); users+=("$user"); funcs+=("$func")
-    printf "  %d) %s %s\n" "$((i+1))" "$host" "${func:+($func)}"
+    printf "  %d) %s %s\n" "$((i+1))" "$(ssh_target "$host" "$user")" "${func:+($func)}"
     i=$((i+1))
   done < <(read_hosts)
 
@@ -570,19 +527,14 @@ option_ssh() {
 
   local target; target="$(ssh_target "${hosts[$sel]}" "${users[$sel]}")"
   log_info "Connecting to $target (keys preferred; password fallback)..."
-
-  # First try key-based interactive ssh
   if ssh "${SSH_OPTS[@]}" "$target"; then
     return 0
   fi
-
-  # If that fails, try password-based (if we can)
   if ensure_password; then
     local pass="$PASS_CACHE"
     SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no "$target"
     return 0
   fi
-
   log_err "Unable to connect to $target (no key auth success and no password available)."
   return 0
 }
@@ -615,17 +567,13 @@ option_deps() {
   dependency_status || true
   validate_layout || true
   if [[ -n "${HOSTS_CSV:-}" && -f "$HOSTS_CSV" ]]; then
-    local n
-    n="$(read_hosts | wc -l | tr -d ' ')"
+    local n; n="$(read_hosts | wc -l | tr -d ' ')"
     log_info "Parsed hosts: $n"
   fi
   if [[ -n "${CREDS_FILE:-}" && -f "$CREDS_FILE" ]]; then
-    if read_password >/dev/null 2>&1; then
-      log_ok "Credentials file contains a password."
-    else
-      log_warn "Credentials file missing/empty password."
-    fi
+    if read_password >/dev/null 2>&1; then log_ok "Credentials file contains a password."; else log_warn "Credentials file missing/empty password."; fi
   fi
+  log_file
   return 0
 }
 
@@ -649,20 +597,14 @@ show_startup_checks_once() {
   if [[ "$STARTUP_SHOWN" -eq 1 ]]; then return 0; fi
   STARTUP_SHOWN=1
   dependency_status || true
-  if [[ -n "${HOSTS_CSV:-}" && -f "$HOSTS_CSV" ]]; then
-    log_ok "hosts.csv found: $HOSTS_CSV"
-  else
-    log_warn "hosts.csv not found yet (see option 5)."
-  fi
+  if [[ -n "${HOSTS_CSV:-}" && -f "$HOSTS_CSV" ]]; then log_ok "hosts.csv found: $HOSTS_CSV"; else log_warn "hosts.csv not found yet (see option 5)."; fi
   if [[ -n "${CREDS_FILE:-}" && -f "$CREDS_FILE" ]]; then
-    if read_password >/dev/null 2>&1; then
-      log_ok "credentials present: $CREDS_FILE"
-    else
-      log_warn "credentials file empty: $CREDS_FILE"
-    fi
+    if read_password >/dev/null 2>&1; then log_ok "credentials present: $CREDS_FILE"; else log_warn "credentials file empty: $CREDS_FILE"; fi
   else
     log_warn "credentials file not found (see expected layout)."
   fi
+  log_ok "default ssh user: $SSH_USER_DEFAULT"
+  log_file
   echo
 }
 
@@ -696,7 +638,6 @@ main_menu() {
     printf "Select an option: "
     local opt
     IFS= read -r opt || true
-
     case "${opt:-}" in
       1) option_go || true ;;
       2) option_ssh || true ;;
@@ -708,7 +649,6 @@ main_menu() {
       q|Q) exit 0 ;;
       *) log_warn "Invalid choice: ${opt:-<blank>}"; sleep 1 ;;
     esac
-
     pause
   done
 }
