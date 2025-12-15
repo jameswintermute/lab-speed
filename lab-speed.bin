@@ -117,6 +117,9 @@ pause() { echo; read -r -p "Press Enter to return to menu..." _ || true; }
 
 trim() { echo "${1:-}" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
 
+# NEW (minimal): strip scheme/path so "https://host/path" becomes "host"
+clean_host() { echo "${1:-}" | sed -e 's#^[a-zA-Z]\+://##' -e 's#/.*$##'; }
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { log_warn "Missing dependency: $1"; return 1; }
 }
@@ -184,14 +187,40 @@ read_password() {
 }
 
 read_hosts() {
+  # Backwards-compat:
+  #   Old: host,user,function
+  #   New: host-url,external-ip,internal-ip,function   (optionally + ,user as 5th column)
+  #
+  # Output stays: host_or_ip,user,function
   awk -F',' '
     function trim(s){ sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function clean(s){
+      s=trim(s);
+      sub(/^[A-Za-z]+:\/\//, "", s);
+      sub(/\/.*$/, "", s);
+      return s
+    }
     /^[ \t\r]*$/ { next }
     /^[ \t\r]*#/ { next }
     {
-      h = trim($1); u = trim($2); f = trim($3)
-      if (tolower(h) ~ /^host(name)?$/) next
-      if (h != "") print h "," u "," f
+      # skip header rows
+      c1=tolower(trim($1));
+      if (c1 ~ /^host(url)?$/ || c1 ~ /^hostname$/) next
+
+      if (NF >= 4) {
+        # new format
+        hosturl = clean($1);
+        extip   = clean($2);
+        intip   = clean($3);
+        func    = trim($4);
+        user    = (NF>=5 ? trim($5) : "");
+        target  = (extip != "" ? extip : hosturl);
+        if (target != "") print target "," user "," func
+      } else {
+        # old format
+        h = clean($1); u = trim($2); f = trim($3);
+        if (h != "") print h "," u "," f
+      }
     }
   ' "$HOSTS_CSV"
 }
@@ -344,20 +373,28 @@ step_set_prompt() {
     func_label="${func:-lab}"
 
     log_info "Setting PS1 on $target (function=$func_label)"
+    # Minimal but robust: rewrite a marked block (idempotent) and avoid tricky sed quoting.
     SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target" "bash -lc '
+      set -e
       PROFILE=~/.bash_profile
-      MARK="# lab-speed PS1"
-      PS1_LINE="export PS1=\\"[\\u@[\\e[30;42m]${func_label}[\\e[0m]\\h \\W]\\$ \\""
-      touch "\$PROFILE"
-      if ! grep -qF "\$MARK" "\$PROFILE"; then
-        {
-          echo ""
-          echo "\$MARK"
-          echo "\$PS1_LINE"
-        } >> "\$PROFILE"
-      else
-        sed -i "s|^export PS1=.*|\\$PS1_LINE|" "\$PROFILE" 2>/dev/null || true
-      fi
+      START=\"# >>> lab-speed PS1 >>>\"
+      END=\"# <<< lab-speed PS1 <<<\"
+      PS1_EXPORT=\"export PS1=\\\"[\\\\u@\\\\[\\\\e[30;42m\\\\]${func_label}\\\\[\\\\e[0m\\\\]\\\\h \\\\W]\\\\\\$ \\\"\\\"
+      mkdir -p \"\$(dirname \"\$PROFILE\")\" 2>/dev/null || true
+      touch \"\$PROFILE\"
+      tmp=\"\$PROFILE.labspeed.\$\$\"
+      awk -v s=\"\$START\" -v e=\"\$END\" '
+        \$0==s {in=1; next}
+        \$0==e {in=0; next}
+        in==0 {print}
+      ' \"\$PROFILE\" > \"\$tmp\"
+      {
+        echo \"\"
+        echo \"\$START\"
+        echo \"\$PS1_EXPORT\"
+        echo \"\$END\"
+      } >> \"\$tmp\"
+      mv \"\$tmp\" \"\$PROFILE\"
     '" >/dev/null 2>&1       && log_ok "Prompt set on $target"       || log_warn "Prompt update failed on $target (continuing)"
   done < <(read_hosts)
 
