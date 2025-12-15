@@ -141,6 +141,28 @@ check_dependencies() {
   return "$missing"
 }
 
+# NEW: human-visible dependency status (non-fatal)
+dependency_status() {
+  echo
+  log_info "Dependency check:"
+  local c ok=1
+  for c in bash awk sed ssh rsync sshpass; do
+    if command -v "$c" >/dev/null 2>&1; then
+      log_ok "  $c"
+    else
+      log_warn "  $c (missing)"
+      ok=0
+    fi
+  done
+  if command -v timeout >/dev/null 2>&1; then
+    log_ok "  timeout (optional)"
+  else
+    log_info "  timeout (optional, not installed)"
+  fi
+  echo
+  return $(( ok==1 ? 0 : 1 ))
+}
+
 validate_layout() {
   local bad=0
   if [[ -z "${HOSTS_CSV:-}" || ! -f "$HOSTS_CSV" ]]; then
@@ -184,6 +206,56 @@ read_password() {
   pass="$(trim "$pass")"
   [[ -n "$pass" ]] || { log_warn "could not parse password from $CREDS_FILE"; return 1; }
   printf "%s" "$pass"
+}
+
+# NEW: prompt user if creds missing/empty (cache in PASS_CACHE)
+PASS_CACHE=""
+ensure_password() {
+  if [[ -n "${PASS_CACHE:-}" ]]; then
+    return 0
+  fi
+
+  local pass=""
+  pass="$(read_password 2>/dev/null || true)"
+  pass="$(trim "$pass")"
+
+  if [[ -n "$pass" ]]; then
+    PASS_CACHE="$pass"
+    return 0
+  fi
+
+  echo
+  log_warn "No SSH password found in credentials file."
+  if [[ -z "${CREDS_FILE:-}" ]]; then
+    # layout expects a creds file, but be defensive
+    CREDS_FILE="$LOCAL_DIR/credentials.txt"
+  fi
+
+  # Prompt interactively
+  read -r -s -p "Enter SSH password (will not echo): " pass || true
+  echo
+  pass="$(trim "$pass")"
+  if [[ -z "$pass" ]]; then
+    log_err "Password not provided. Aborting this action."
+    return 1
+  fi
+
+  # Offer to save
+  read -r -p "Save password to $(basename "$CREDS_FILE") for this repo? (Y/n): " ans || true
+  case "${ans:-Y}" in
+    n|N)
+      log_info "Password will be used for this run only."
+      ;;
+    *)
+      mkdir -p "$(dirname "$CREDS_FILE")" 2>/dev/null || true
+      printf "%s\n" "SSH_PASS=$pass" > "$CREDS_FILE"
+      chmod 600 "$CREDS_FILE" 2>/dev/null || true
+      log_ok "Saved credentials to $CREDS_FILE"
+      ;;
+  esac
+
+  PASS_CACHE="$pass"
+  return 0
 }
 
 read_hosts() {
@@ -251,6 +323,9 @@ step_validate() {
     log_warn "No usable hosts found in $HOSTS_CSV"
     return 1
   fi
+  # NEW: catch empty creds early and prompt user
+  ensure_password || return 1
+
   log_ok "Inputs validated."
   log_ok "hosts.csv: $HOSTS_CSV"
   log_ok "creds    : $CREDS_FILE"
@@ -261,7 +336,8 @@ step_validate() {
 
 step_connectivity_check() {
   echo "[2/5] Checking connectivity to server list..."
-  local pass; pass="$(read_password)" || return 1
+  ensure_password || return 1
+  local pass="$PASS_CACHE"
 
   local lines total okcount done
   mapfile -t lines < <(read_hosts)
@@ -310,7 +386,8 @@ step_connectivity_check() {
 
 step_install_ssh_key() {
   echo "[3/5] Installing SSH key to lab servers (ssh-copy-id)..."
-  local pass; pass="$(read_password)" || return 1
+  ensure_password || return 1
+  local pass="$PASS_CACHE"
 
   if [[ -n "${SSH_KEY_PUB:-}" && -f "$SSH_KEY_PUB" ]]; then
     log_info "Using repo key: $SSH_KEY_PUB"
@@ -341,7 +418,8 @@ step_install_ssh_key() {
 
 step_rsync_files() {
   echo "[4/5] RSYNC syncing files-to-copy -> ${REMOTE_DIR} ..."
-  local pass; pass="$(read_password)" || return 1
+  ensure_password || return 1
+  local pass="$PASS_CACHE"
 
   local line host user func target
   while IFS= read -r line; do
@@ -362,7 +440,8 @@ step_rsync_files() {
 
 step_set_prompt() {
   echo "[5/5] Setting remote ~/.bash_profile prompt (PS1)..."
-  local pass; pass="$(read_password)" || return 1
+  ensure_password || return 1
+  local pass="$PASS_CACHE"
 
   local line host user func target func_label
   while IFS= read -r line; do
@@ -373,7 +452,7 @@ step_set_prompt() {
     func_label="${func:-lab}"
 
     log_info "Setting PS1 on $target (function=$func_label)"
-    # Minimal but robust: rewrite a marked block (idempotent) and avoid tricky sed quoting.
+    # Robust + idempotent: rewrite a marked block.
     SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target" "bash -lc '
       set -e
       PROFILE=~/.bash_profile
@@ -439,7 +518,8 @@ option_ssh() {
   sel=$((sel-1))
   (( sel >= 0 && sel < ${#hosts[@]} )) || { log_warn "Invalid selection."; return 0; }
 
-  local pass; pass="$(read_password)" || return 0
+  ensure_password || return 0
+  local pass="$PASS_CACHE"
   local target; target="$(ssh_target "${hosts[$sel]}" "${users[$sel]}")"
   log_info "Connecting to $target (password creds)..."
   SSHPASS="$pass" sshpass -e ssh "${SSH_OPTS[@]}" "$target"
@@ -470,6 +550,25 @@ option_review_files() {
   return 0
 }
 
+# NEW: manual dependency check option
+option_deps() {
+  dependency_status || true
+  validate_layout || true
+  if [[ -n "${HOSTS_CSV:-}" && -f "$HOSTS_CSV" ]]; then
+    local n
+    n="$(read_hosts | wc -l | tr -d ' ')"
+    log_info "Parsed hosts: $n"
+  fi
+  if [[ -n "${CREDS_FILE:-}" && -f "$CREDS_FILE" ]]; then
+    if read_password >/dev/null 2>&1; then
+      log_ok "Credentials file contains a password."
+    else
+      log_warn "Credentials file missing/empty password."
+    fi
+  fi
+  return 0
+}
+
 option_cleanup() {
   echo
   echo "This will delete credentials file: ${CREDS_FILE:-<not found>}"
@@ -477,6 +576,7 @@ option_cleanup() {
   case "${ans:-}" in
     y|Y)
       [[ -n "${CREDS_FILE:-}" ]] && rm -f -- "$CREDS_FILE"
+      PASS_CACHE=""
       log_ok "Deleted credentials file."
       ;;
     *) log_info "Cleanup cancelled." ;;
@@ -484,8 +584,33 @@ option_cleanup() {
   return 0
 }
 
+# NEW: show startup checks once per run
+STARTUP_SHOWN=0
+show_startup_checks_once() {
+  if [[ "$STARTUP_SHOWN" -eq 1 ]]; then return 0; fi
+  STARTUP_SHOWN=1
+  dependency_status || true
+  # quick hints on files
+  if [[ -n "${HOSTS_CSV:-}" && -f "$HOSTS_CSV" ]]; then
+    log_ok "hosts.csv found: $HOSTS_CSV"
+  else
+    log_warn "hosts.csv not found yet (see option 6)."
+  fi
+  if [[ -n "${CREDS_FILE:-}" && -f "$CREDS_FILE" ]]; then
+    if read_password >/dev/null 2>&1; then
+      log_ok "credentials present: $CREDS_FILE"
+    else
+      log_warn "credentials file empty: $CREDS_FILE"
+    fi
+  else
+    log_warn "credentials file not found (see expected layout)."
+  fi
+  echo
+}
+
 show_menu() {
   header
+  show_startup_checks_once
   cat <<'EOF'
 
 ### GO! - High Speed start ###
@@ -496,6 +621,7 @@ show_menu() {
   3) RSYNC: Rerun a file sync to lab servers '/tmp' directory (files-to-copy -> /tmp/lab-speed)
 
 ### Inspection ###
+  5) Dependency check (manual)
   6) Show hosts.csv
   8) Review files-to-copy
 
@@ -517,6 +643,7 @@ main_menu() {
       1) option_go || true ;;
       2) option_ssh || true ;;
       3) option_rsync || true ;;
+      5) option_deps || true ;;
       6) option_show_hosts || true ;;
       7) option_cleanup || true ;;
       8) option_review_files || true ;;
