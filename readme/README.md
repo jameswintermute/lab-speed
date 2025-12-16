@@ -1,12 +1,12 @@
 # lab-speed
 
-A rapid lab setup utility for short-lived training labs: generate a disposable SSH key, distribute files via rsync, and apply a helpful shell prompt per host.
+A rapid lab setup utility for short‑lived training labs: distribute files to lab hosts and open SSH sessions quickly.
 
-> Designed for **speed**: get connected and ready in minutes (even if you only have an hour).
+> Designed for **speed**: get connected and ready in minutes.
 
 ---
 
-## Fast Start (recommended)
+## Fast Start
 
 ### 1) Get the repo
 
@@ -18,7 +18,7 @@ chmod +x lab-speed.bin
 
 ### 2) Fill in `local/credentials.txt`
 
-Run the tool once and it will prompt you (and store with chmod 600):
+Run the tool once and it will prompt you (and store with `chmod 600`):
 
 ```bash
 ./lab-speed.bin
@@ -29,14 +29,14 @@ Or edit manually:
 `local/credentials.txt`
 ```bash
 # lab-speed credentials (chmod 600)
-username="value"
+username="YOUR_LAB_USERNAME"
 password="YOUR_LAB_PASSWORD"
 SSHPASS="YOUR_LAB_PASSWORD"   # usually same as password
 ```
 
 ### 3) Fill in `local/hosts.csv`
 
-You need at least the columns:
+Required columns:
 - `external-ip` (or `external_ip`)
 - `function` (friendly label shown in menus)
 
@@ -50,100 +50,70 @@ https://example-idx1,2.3.5.157,10.0.0.2,Splunk-IDX1
 
 ### 4) Put files you want copied into `files-to-copy/`
 
-Everything in `files-to-copy/` will be copied to each lab host:
+Everything in `files-to-copy/` is copied to each lab host:
 
 Remote target:
 ```
 /tmp/lab-speed/
 ```
 
-### 5) Run GO! (option 1)
+### 5) Run **GO!** (menu option 1)
 
 From the menu:
 
-- **1) Copy ssh-keys, RSYNC files to lab '/tmp', Console setup**
+- **1) GO! (install ssh key, RSYNC files)**
 
 This will:
-1. Validate `hosts.csv`
-2. Ensure your lab key exists in `local/`
-3. Try key auth; if missing and **password SSH is allowed**, it will bootstrap the key using `sshpass`
-4. rsync `files-to-copy/` to `/tmp/lab-speed/`
-5. Set a clear prompt based on `function` (new shells pick it up)
+1. Validate inputs (`hosts.csv`, `credentials.txt`, `files-to-copy/`)
+2. Provision each host by copying `files-to-copy/` → `/tmp/lab-speed/`
+3. Print a clear end summary (how many hosts succeeded) and recommend next steps
 
 ---
 
-## Dependency check (important)
+## Menu overview
+
+- **1) GO!** — fast provision all hosts (with a progress meter)
+- **2) SSH to host** — shows a function‑first list, then opens an SSH session (in a new terminal when available)
+- **3) RSYNC again** — re-push `files-to-copy/` to all hosts (progress meter)
+- **7) Clean up** — remove local credentials file
+
+---
+
+## Dependency check
 
 **Required**
-- `ssh` + `ssh-keygen` (package: `openssh-client`)
+- `bash`
+- `ssh` (package: `openssh-client`)
 - `rsync`
-- `awk` (package: `gawk` on Ubuntu)
-- `sed`
+- `awk`, `sed`
 
-**Recommended**
-- `sshpass`  
-  Used to automatically install your disposable lab public key **when password SSH is enabled**.
+**Recommended / used for non-interactive runs**
+- `sshpass`
 
-### Install dependencies (with sudo)
+### Install dependencies (Ubuntu/Debian)
 
 ```bash
 sudo apt-get update && sudo apt-get install -y openssh-client rsync gawk sed sshpass
 ```
 
-### If you do NOT have admin rights
-
-Ask your lab/instructor/admin to install the missing packages for you:
-
-- `openssh-client`
-- `rsync`
-- `gawk`
-- `sed`
-- `sshpass` (recommended for full automation)
-
-lab-speed will print a clear “missing dependencies” message and the package list to request.
-
----
-
-## How key setup works
-
-lab-speed uses a **dedicated, disposable lab SSH identity** stored inside this repo:
-
-- Private key: `local/lab_speed_ed25519`
-- Public key: `local/lab_speed_ed25519.pub`
-
-### Automation rules
-
-- If the lab host supports **password SSH**, lab-speed can use `sshpass` one time to append the public key into:
-  ```
-  ~/<username>/.ssh/authorized_keys
-  ```
-  Then all future actions use **key auth** (fast, no prompts).
-
-- If password SSH is **disabled**, lab-speed cannot install keys automatically (no valid auth path).
-  In that case it prints the public key and tells you to ask the lab/admin to install it.
-
----
-
-## lab-connect
-
-Menu option **2) SSH to the servers in our hosts file**
-
-- If key auth is enabled for that host, it opens an SSH session.
-- If not, it shows your public key and returns to the menu (no hanging password prompts).
+If you do NOT have admin rights, ask your lab/instructor/admin to install:
+- `openssh-client`, `rsync`, `gawk`, `sed`, `sshpass`
 
 ---
 
 ## Troubleshooting
 
-### “Permission denied (publickey,…)” / lab-connect closes immediately
-Key isn’t installed yet for that host/user.
+### “hostname contains invalid characters”
+Usually caused by hidden `\r` characters in `hosts.csv` (Windows line endings).
 
-- If password SSH is enabled: install `sshpass` and run option **1** again.
-- If password SSH is disabled: ask lab/admin to install `local/lab_speed_ed25519.pub` into `authorized_keys`.
+Fix:
+```bash
+sed -i 's/\r$//' local/hosts.csv
+```
 
-### “MISSING: sshpass” but I can’t sudo
-Ask your lab/instructor/admin to install `sshpass` (and any other missing packages).  
-Without `sshpass`, the tool cannot non-interactively bootstrap keys via password.
+### SSH session opens then immediately closes
+If your terminal emulator opens a new window and closes on exit, that is expected.
+If you want it to stay open, run SSH from the main window (or adjust your terminal profile).
 
 ---
 
