@@ -5,6 +5,25 @@
 #
 # This program comes with ABSOLUTELY NO WARRANTY.
 #
+# Expected layout (repo root = same directory as this script):
+#   local/hosts.csv
+#   local/credentials.txt   (or local/creds.txt)
+#   files-to-copy/
+#
+# Backwards-compat also supported:
+#   ./hosts.csv
+#   ./creds.txt
+#   ./credentials.txt
+#
+# v1.1.13:
+#  - Adds connectivity pre-check with progress bar and concise summary
+#  - Adds colorized log levels ([OK]/[INFO]/[WARN]/[ERROR]) to reduce “wall of errors”
+#
+# v1.1.14 (local):
+#  - Credentials file provides username+password (no hardcoded user)
+#  - Function-first SSH menu (and tries to open new terminal window)
+#  - Stronger RSYNC ssh option handling + per-host summary
+#  - PS1 applied in .bashrc + .bash_profile sourcing
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -21,7 +40,6 @@ MAX_PARALLEL="${LABSPEED_PARALLEL:-8}"
 LOGS_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOGS_DIR"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_LOG="$LOGS_DIR/lab-speed-$RUN_ID.log"
-TMP_RUN_DIR="${LOGS_DIR}/.tmp-${RUN_ID}"; mkdir -p "$TMP_RUN_DIR"
 
 PASS_CACHE=""
 USER_CACHE=""
@@ -49,7 +67,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.13 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.14 - Dec 2025. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -69,7 +87,6 @@ on_err() {
   return "$ec"
 }
 trap on_err ERR
-trap 'rm -rf "$TMP_RUN_DIR" 2>/dev/null || true' EXIT
 
 pause() { echo; read -r -p "Press Enter to return to menu..." _ || true; }
 trim() { echo "${1:-}" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
@@ -226,23 +243,18 @@ ensure_credentials() {
 }
 
 read_hosts() {
+  # Accept 2 or 3+ columns.
+  # Preferred CSV: ip,function  OR ip,username,function (username ignored; creds file supplies username)
+  # Skips header row if present.
   awk -F',' '
-    function trim(s){ sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-    function clean(s){ s=trim(s); sub(/^[A-Za-z]+:\/\//, "", s); sub(/\/.*$/, "", s); return s }
-    /^[ \t\r]*$/ { next }
-    /^[ \t\r]*#/ { next }
-    {
-      c1=tolower(trim($1))
-      if (c1=="host" || c1=="hostname" || c1=="hosturl" || c1=="host-url" || c1=="host_url") next
-      if (NF >= 4) {
-        hosturl = clean($1); extip = clean($2); intip = clean($3); func = trim($4);
-        user = (NF>=5 ? trim($5) : "");
-        target = (extip != "" ? extip : hosturl);
-        if (target != "") print target "," user "," func
-      } else {
-        h=clean($1); u=trim($2); f=trim($3);
-        if (h != "") print h "," u "," f
-      }
+    NR==1 {
+      if (tolower($1) ~ /ip|host/ || $1 ~ /[A-Za-z]/) { next }
+    }
+    NF>=2 {
+      h=$1; gsub(/^[ 	]+|[ 	]+$/, "", h)
+      if (NF>=3) { f=$3 } else { f=$2 }
+      gsub(/^[ 	]+|[ 	]+$/, "", f)
+      if (h!="") { print h "," "" "," f }
     }
   ' "$HOSTS_CSV"
 }
@@ -323,41 +335,78 @@ step_validate() {
 }
 
 step_connectivity_check() {
-  echo "[2/5] Checking connectivity to server list..."
-  ensure_credentials || true
+  local total="${#HOSTS[@]}"
+  local keycount=0
 
-  local lines total okcount done
-  mapfile -t lines < <(read_hosts)
-  total="${#lines[@]}"; okcount=0; done=0
-  [[ "$total" -eq 0 ]] && { log_warn "No hosts to check."; return 1; }
+  # Fast path: reuse cached results if they are recent and hosts.csv hasn't changed
+  if [ -f "$CONN_CACHE_FILE" ]; then
+    local meta
+    meta="$(head -n 1 "$CONN_CACHE_FILE" 2>/dev/null || true)"
+    if printf "%s" "$meta" | grep -q '^META|'; then
+      local mtime size epoch cached_total now age
+      mtime="$(printf "%s" "$meta" | awk -F'|' '{print $2}')"
+      size="$(printf "%s" "$meta" | awk -F'|' '{print $3}')"
+      epoch="$(printf "%s" "$meta" | awk -F'|' '{print $4}')"
+      cached_total="$(printf "%s" "$meta" | awk -F'|' '{print $5}')"
+      now="$(date +%s)"
+      age=$(( now - epoch ))
 
-  log_info "Running ${total} connectivity checks (timeout=${CONNECT_CHECK_TIMEOUT}s each)..."
+      local cur_mtime cur_size
+      cur_mtime="$(stat -c %Y "$HOSTS_CSV" 2>/dev/null || echo 0)"
+      cur_size="$(stat -c %s "$HOSTS_CSV" 2>/dev/null || echo 0)"
 
-  # IMPORTANT: this step is intentionally SEQUENTIAL for reliability.
-  # Parallel variants were observed to hang on some systems/TTYs.
-  local line host user func target label
-  for line in "${lines[@]}"; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_target "$host" "$user")"
-    label="${func:-host} — ${host}"
+      if [ "$age" -ge 0 ] && [ "$age" -lt "$CONN_CACHE_TTL" ] \
+         && [ "$cur_mtime" = "$mtime" ] && [ "$cur_size" = "$size" ] \
+         && [ "$cached_total" = "$total" ]; then
 
-    if probe_host_ok "$target"; then
-      ST_CONN["$host"]="OK"
-      okcount=$((okcount+1))
-    else
-      ST_CONN["$host"]="FAIL"
+        # Load reachable targets from cache
+        REACHABLE_TARGETS=()
+        while IFS='|' read -r target ok; do
+          [ -z "${target:-}" ] && continue
+          [ "${ok:-0}" = "1" ] && REACHABLE_TARGETS+=("$target")
+        done < <(tail -n +2 "$CONN_CACHE_FILE" 2>/dev/null || true)
+
+        keycount="${#REACHABLE_TARGETS[@]}"
+        log_info "Connectivity: ${keycount}/${total} reachable (cached, age=${age}s)."
+        return 0
+      fi
     fi
-    done=$((done+1))
-    progress_bar "$okcount" "$done" "$total" "$label"
-  done
-  echo
+  fi
 
-  if [[ "$okcount" -eq "$total" ]]; then
-    log_ok "Connectivity OK: ${okcount}/${total} hosts reachable."
+  # Slow path: run active connectivity checks with progress bar
+  connectivity_check "${HOSTS[@]}" "${USERS[@]}" "${FUNCS[@]}"
+
+  REACHABLE_TARGETS=()
+  for i in "${!HOSTS[@]}"; do
+    local target
+    target="$(ssh_target "$i")"
+    if [ "${ST_CONN[$target]:-0}" = "1" ]; then
+      REACHABLE_TARGETS+=("$target")
+      keycount=$((keycount+1))
+    fi
+  done
+
+  # Save cache for faster subsequent menu operations
+  local cur_mtime cur_size now
+  cur_mtime="$(stat -c %Y "$HOSTS_CSV" 2>/dev/null || echo 0)"
+  cur_size="$(stat -c %s "$HOSTS_CSV" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  {
+    printf "META|%s|%s|%s|%s
+" "$cur_mtime" "$cur_size" "$now" "$total"
+    for i in "${!HOSTS[@]}"; do
+      local target
+      target="$(ssh_target "$i")"
+      printf "%s|%s
+" "$target" "${ST_CONN[$target]:-0}"
+    done
+  } > "$CONN_CACHE_FILE" 2>/dev/null || true
+
+  if [ "${#REACHABLE_TARGETS[@]}" -eq 0 ]; then
+    log_warn "Connectivity partial: 0/${total} hosts reachable."
+    log_warn "Proceeding anyway (failed hosts will be skipped in later steps)."
   else
-    log_warn "Connectivity partial: ${okcount}/${total} hosts reachable."
+    log_info "Connectivity: ${keycount}/${total} hosts reachable. (parallel=${MAX_PARALLEL})"
     log_warn "Proceeding anyway (failed hosts will be skipped in later steps)."
   fi
   return 0
@@ -383,7 +432,16 @@ step_install_ssh_key() {
   mapfile -t lines < <(read_hosts)
   total="${#lines[@]}"; okcount=0; done=0
 
-  log_info "Installing keys (sequential; reliable)..."
+  log_info "Installing keys (parallel=${MAX_PARALLEL})..."
+  progress_bar 0 0 "$total" "starting…"
+
+  local tmpd fifo
+  tmpd="$(mktemp -d)"
+  fifo="$tmpd/keyresults.fifo"
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+
+  sem_init
 
   local line host user func target label
   for line in "${lines[@]}"; do
@@ -400,37 +458,58 @@ step_install_ssh_key() {
       continue
     fi
 
-    local hlog="$TMP_RUN_DIR/$host.sshcopy.log"
-    : >"$hlog" 2>/dev/null || true
-
-    if sshpass -p "$PASS_CACHE" ssh-copy-id "${keyopt[@]}" \
-        -o StrictHostKeyChecking=accept-new \
-        -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
-        "$target" >"$hlog" 2>&1; then
-      ST_KEY["$host"]="OK"
-      okcount=$((okcount+1))
-    else
-      ST_KEY["$host"]="FAIL"
-    fi
-
-    # append a short excerpt to run log so failures are actionable
+    sem_acquire
     {
-      echo
-      echo "----- ssh-copy-id ${func:-HOST} $target -----"
-      sed -n '1,120p' "$hlog"
-    } >>"$RUN_LOG"
+      local hlog="$tmpd/$host.sshcopy.log"
+      if sshpass -p "$PASS_CACHE" ssh-copy-id "${keyopt[@]}" \
+          -o StrictHostKeyChecking=accept-new \
+          -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+          "$target" >"$hlog" 2>&1; then
+        printf "%s	OK	%s
+" "$host" "$label" >"$tmpd/$host.key"
+        printf "%s	OK	%s
+" "$host" "$label" >&3
+      else
+        printf "%s	FAIL	%s
+" "$host" "$label" >"$tmpd/$host.key"
+        printf "%s	FAIL	%s
+" "$host" "$label" >&3
+      fi
+      sem_release
+    } &
+  done
 
+  while [[ "$done" -lt "$total" ]]; do
+    local h st lbl
+    IFS=$'	' read -r -u 3 h st lbl || break
+    ST_KEY["$h"]="$st"
+    [[ "$st" == "OK" ]] && okcount=$((okcount+1))
     done=$((done+1))
-    progress_bar "$okcount" "$done" "$total" "$label"
+    progress_bar "$okcount" "$done" "$total" "$lbl"
   done
   echo
 
-  if [[ "$okcount" -eq "$total" ]]; then
-    log_ok "SSH key install OK: ${okcount}/${total} hosts."
-  else
-    log_warn "SSH key install partial: ${okcount}/${total} hosts."
-    log_info "See run log for ssh-copy-id output: $RUN_LOG"
-  fi
+  wait
+  sem_close
+  exec 3>&- 3<&-
+  rm -f "$fifo" 2>/dev/null || true
+
+  # Append per-host logs into run log (first 200 lines each)
+  for line in "${lines[@]}"; do
+    host="$(trim "${line%%,*}")"
+    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
+    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
+    target="$(ssh_target "$host" "$user")"
+    if [[ -f "$tmpd/$host.sshcopy.log" ]]; then
+      {
+        echo
+        echo "----- ssh-copy-id ${func:-HOST} $target -----"
+        sed -n '1,200p' "$tmpd/$host.sshcopy.log"
+      } >>"$RUN_LOG"
+    fi
+  done
+
+  rm -rf "$tmpd" 2>/dev/null || true
   return 0
 }
 
