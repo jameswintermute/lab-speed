@@ -1,149 +1,107 @@
 #!/usr/bin/env bash
+# lab-speed — rapid lab setup utility
+# v1.1.19 — Dec 2025 — James Wintermute
 set -Eeuo pipefail
-IFS=$'\n\t'
 
-# ───────────────────────── Colours ─────────────────────────
-CLR_MAG="\033[35m"
-CLR_GRN="\033[32m"
-CLR_RED="\033[31m"
-CLR_RST="\033[0m"
-
-# ───────────────────────── ASCII BANNER (VERBATIM) ─────────────────────────
 header() {
   clear
   printf "%b" "$CLR_MAG"
-  printf "%s\n" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
-  printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
-  printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
+  printf "%s
+" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
+  printf "%s
+" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
+  printf "%s
+" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.1.18 - Dec 2025. James Wintermute"
+  printf "\n%s\n" "      v1.1.19 - Dec 2025. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
-# ───────────────────────── Globals ─────────────────────────
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOCAL_DIR="$BASE_DIR/local"
-FILES_DIR="$BASE_DIR/files-to-copy"
-LOG_DIR="$BASE_DIR/logs"
-KNOWN_HOSTS_FILE="$BASE_DIR/.known_hosts"
+CLR_MAG="\033[35m"
+CLR_RST="\033[0m"
 
-CREDS_FILE="$LOCAL_DIR/credentials.txt"
-HOSTS_FILE="$LOCAL_DIR/hosts.csv"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+LOCAL="$ROOT/local"
+FILES="$ROOT/files-to-copy"
+KNOWN="$ROOT/.known_hosts"
+LOGS="$ROOT/logs"
+mkdir -p "$LOCAL" "$FILES" "$LOGS"
 
-mkdir -p "$LOG_DIR"
+HOSTS_FILE="$LOCAL/hosts.csv"
+CREDS_FILE="$LOCAL/credentials.txt"
 
-# Safe initialisation (set -u proof)
-USERNAME=""
-PASSWORD=""
-
-# ───────────────────────── Logging ─────────────────────────
-log() { printf "%s\n" "$1"; }
-
-# ───────────────────────── Progress bar ─────────────────────────
-progress_bar() {
-  local current="$1"
-  local total="$2"
-  local label="$3"
-  printf "[%d/%d] %s\n" "$current" "$total" "$label"
+progress() {
+  local cur="$1" total="$2" msg="$3"
+  local width=20
+  local filled=$(( cur * width / total ))
+  printf "\r[%-*s] %d/%d %s" "$width" "$(printf '#%.0s' $(seq 1 $filled))" "$cur" "$total" "$msg"
 }
 
-# ───────────────────────── Read credentials ─────────────────────────
-load_creds() {
+read_creds() {
   if [[ ! -f "$CREDS_FILE" ]]; then
-    log "[ERROR] Missing local/credentials.txt"
-    exit 1
+    read -rp "Username: " u
+    read -rsp "Password: " p; echo
+    cat >"$CREDS_FILE"<<EOF
+username="$u"
+password="$p"
+SSHPASS="$p"
+EOF
+    chmod 600 "$CREDS_FILE"
   fi
-  # shellcheck disable=SC1090
   source "$CREDS_FILE"
-  USERNAME="${username:-}"
-  PASSWORD="${password:-}"
-  if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
-    log "[ERROR] credentials.txt must define username and password"
-    exit 1
-  fi
 }
 
-# ───────────────────────── Read hosts ─────────────────────────
 read_hosts() {
-  tail -n +2 "$HOSTS_FILE" | awk -F',' '{print $2","$4}'
+  awk -F',' 'NR>1 {print $2 "," $4}' "$HOSTS_FILE"
 }
 
-# ───────────────────────── Connectivity check ─────────────────────────
-check_connectivity() {
-  load_creds
+go_run() {
+  read_creds
   mapfile -t HOSTS < <(read_hosts)
   local total="${#HOSTS[@]}"
   local i=0
-  for h in "${HOSTS[@]}"; do
+  for line in "${HOSTS[@]}"; do
     i=$((i+1))
-    IFS=',' read -r host func <<<"$h"
-    progress_bar "$i" "$total" "$func - $host"
-    sshpass -p "$PASSWORD" ssh       -o PreferredAuthentications=password       -o PubkeyAuthentication=no       -o StrictHostKeyChecking=accept-new       -o UserKnownHostsFile="$KNOWN_HOSTS_FILE"       -o ConnectTimeout=5       "$USERNAME@$host" "true" >/dev/null
+    IFS=',' read -r host func <<<"$line"
+    progress "$i" "$total" "$func"
+    sshpass -p "$SSHPASS" ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN" "$username@$host" "mkdir -p /tmp/lab-speed" >/dev/null 2>&1 || true
+    sshpass -p "$SSHPASS" rsync -az "$FILES/." "$username@$host:/tmp/lab-speed/" >/dev/null 2>&1 || true
   done
+  echo
+  echo "[OK] GO complete."
 }
 
-# ───────────────────────── SSH key install ─────────────────────────
-install_key() {
-  load_creds
+ssh_menu() {
   mapfile -t HOSTS < <(read_hosts)
-  local total="${#HOSTS[@]}"
+  echo
   local i=0
-  for h in "${HOSTS[@]}"; do
+  for line in "${HOSTS[@]}"; do
     i=$((i+1))
-    IFS=',' read -r host func <<<"$h"
-    progress_bar "$i" "$total" "ssh-copy-id $func"
-    sshpass -p "$PASSWORD" ssh-copy-id       -o StrictHostKeyChecking=accept-new       -o UserKnownHostsFile="$KNOWN_HOSTS_FILE"       "$USERNAME@$host" >/dev/null
+    IFS=',' read -r host func <<<"$line"
+    printf " %d) %-15s (%s)\n" "$i" "$host" "$func"
   done
+  read -rp "#? " sel
+  IFS=',' read -r host _ <<<"${HOSTS[$((sel-1))]}"
+  exec ssh "$username@$host"
 }
 
-# ───────────────────────── RSYNC ─────────────────────────
-do_rsync() {
-  mapfile -t HOSTS < <(read_hosts)
-  local total="${#HOSTS[@]}"
-  local i=0
-  for h in "${HOSTS[@]}"; do
-    i=$((i+1))
-    IFS=',' read -r host func <<<"$h"
-    progress_bar "$i" "$total" "rsync $func"
-    rsync -az "$FILES_DIR/" "$USERNAME@$host:/tmp/lab-speed/"
-  done
-}
-
-# ───────────────────────── Menu ─────────────────────────
 menu() {
-  header
-  cat <<EOF
+  while true; do
+    header
+    cat <<EOF
 1) GO! (install ssh key, RSYNC files)
 2) SSH to host
 3) RSYNC again
 q) Quit
 EOF
+    read -rp "Select an option: " c
+    case "$c" in
+      1) go_run; read -rp "Press Enter..." ;;
+      2) read_creds; ssh_menu ;;
+      3) read_creds; go_run ;;
+      q) exit 0 ;;
+    esac
+  done
 }
 
-# ───────────────────────── Main loop ─────────────────────────
-while true; do
-  menu
-  read -rp "Select an option: " opt
-  case "$opt" in
-    1)
-      check_connectivity
-      install_key
-      do_rsync
-      ;;
-    2)
-      load_creds
-      mapfile -t HOSTS < <(read_hosts)
-      select h in "${HOSTS[@]}"; do
-        IFS=',' read -r host func <<<"$h"
-        ssh "$USERNAME@$host"
-        break
-      done
-      ;;
-    3)
-      do_rsync
-      ;;
-    q)
-      exit 0
-      ;;
-  esac
-done
+menu
