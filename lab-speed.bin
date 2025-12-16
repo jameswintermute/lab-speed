@@ -35,7 +35,7 @@ REMOTE_DIR="/tmp/lab-speed"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-7}"
 CONNECT_CHECK_TIMEOUT="${CONNECT_CHECK_TIMEOUT:-5}"
 
-MAX_PARALLEL="${LABSPEED_PARALLEL:-4}"
+MAX_PARALLEL="${LABSPEED_PARALLEL:-8}"
 
 LOGS_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOGS_DIR"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
@@ -343,45 +343,80 @@ step_connectivity_check() {
   echo "[2/5] Checking connectivity to server list..."
   ensure_credentials || true
 
-  local lines total okcount
+  local lines total okcount done
   mapfile -t lines < <(read_hosts)
-  total="${#lines[@]}"; okcount=0
+  total="${#lines[@]}"; okcount=0; done=0
   [[ "$total" -eq 0 ]] && { log_warn "No hosts to check."; return 1; }
 
-  # Parallel mode: faster checks, summary after completion (no live progress bar).
-  local tmpd; tmpd="$(mktemp -d)"
+  log_info "Spawning ${total} connectivity checks (parallel=${MAX_PARALLEL}, timeout=${CONNECT_CHECK_TIMEOUT}s)..."
+
+  # Parallel checks + live progress bar feedback
+  local tmpd fifo
+  tmpd="$(mktemp -d)"
+  fifo="$tmpd/results.fifo"
+  mkfifo "$fifo"
+
+  # Open FIFO read+write in parent to prevent writer-block deadlocks.
+  exec 3<>"$fifo"
+
   sem_init
 
-  local line host user func target
+  # show an immediate progress line (so it never "hangs" silently)
+  progress_bar 0 0 "$total" "starting…"
+
+  local line host user func target label
   for line in "${lines[@]}"; do
     host="$(trim "${line%%,*}")"
     user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
     func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
     target="$(ssh_target "$host" "$user")"
+    label="${func:-host} — ${host}"
 
     sem_acquire
     {
       if probe_host_ok "$target"; then
-        printf "OK\n" >"$tmpd/$host.conn"
+        printf "%s	OK	%s
+" "$host" "$label" >"$tmpd/$host.conn"
+        printf "%s	OK	%s
+" "$host" "$label" >&3
       else
-        printf "FAIL\n" >"$tmpd/$host.conn"
+        printf "%s	FAIL	%s
+" "$host" "$label" >"$tmpd/$host.conn"
+        printf "%s	FAIL	%s
+" "$host" "$label" >&3
       fi
       sem_release
     } &
   done
 
+  # Read exactly N results for live updates
+  while [[ "$done" -lt "$total" ]]; do
+    local h st lbl
+    IFS=$'	' read -r -u 3 h st lbl || break
+    ST_CONN["$h"]="$st"
+    [[ "$st" == "OK" ]] && okcount=$((okcount+1))
+    done=$((done+1))
+    progress_bar "$okcount" "$done" "$total" "$lbl"
+  done
+  echo
+
   wait
   sem_close
 
-  # Aggregate results
+  # close fifo fd + cleanup
+  exec 3>&- 3<&-
+  rm -f "$fifo" 2>/dev/null || true
+
+  # Ensure every host has a status (defensive)
   for line in "${lines[@]}"; do
     host="$(trim "${line%%,*}")"
-    if [[ -f "$tmpd/$host.conn" ]]; then
-      ST_CONN["$host"]="$(cat "$tmpd/$host.conn" 2>/dev/null || echo FAIL)"
-    else
-      ST_CONN["$host"]="FAIL"
+    if [[ -z "${ST_CONN[$host]:-}" ]]; then
+      if [[ -f "$tmpd/$host.conn" ]]; then
+        ST_CONN["$host"]="$(awk -F'	' '{print $2}' "$tmpd/$host.conn" 2>/dev/null | head -n1)"
+      else
+        ST_CONN["$host"]="FAIL"
+      fi
     fi
-    [[ "${ST_CONN[$host]}" == "OK" ]] && okcount=$((okcount+1))
   done
   rm -rf "$tmpd" 2>/dev/null || true
 
@@ -410,18 +445,33 @@ step_install_ssh_key() {
   local keyopt=()
   [[ -n "${SSH_KEY_PUB:-}" && -f "$SSH_KEY_PUB" ]] && keyopt=( -i "$SSH_KEY_PUB" )
 
-  local tmpd; tmpd="$(mktemp -d)"
+  local lines total okcount done
+  mapfile -t lines < <(read_hosts)
+  total="${#lines[@]}"; okcount=0; done=0
+
+  log_info "Installing keys (parallel=${MAX_PARALLEL})..."
+  progress_bar 0 0 "$total" "starting…"
+
+  local tmpd fifo
+  tmpd="$(mktemp -d)"
+  fifo="$tmpd/keyresults.fifo"
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+
   sem_init
 
-  local line host user func target
-  while IFS= read -r line; do
+  local line host user func target label
+  for line in "${lines[@]}"; do
     host="$(trim "${line%%,*}")"
     user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
     func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
     target="$(ssh_target "$host" "$user")"
+    label="${func:-host} — ${host}"
 
     if [[ "${ST_CONN[$host]:-OK}" == "FAIL" ]]; then
       ST_KEY["$host"]="SKIP"
+      done=$((done+1))
+      progress_bar "$okcount" "$done" "$total" "$label (skipped)"
       continue
     fi
 
@@ -432,40 +482,41 @@ step_install_ssh_key() {
           -o StrictHostKeyChecking=accept-new \
           -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
           "$target" >"$hlog" 2>&1; then
-        printf "OK\n" >"$tmpd/$host.key"
+        printf "%s	OK	%s
+" "$host" "$label" >"$tmpd/$host.key"
+        printf "%s	OK	%s
+" "$host" "$label" >&3
       else
-        printf "FAIL\n" >"$tmpd/$host.key"
+        printf "%s	FAIL	%s
+" "$host" "$label" >"$tmpd/$host.key"
+        printf "%s	FAIL	%s
+" "$host" "$label" >&3
       fi
       sem_release
     } &
-  done < <(read_hosts)
+  done
+
+  while [[ "$done" -lt "$total" ]]; do
+    local h st lbl
+    IFS=$'	' read -r -u 3 h st lbl || break
+    ST_KEY["$h"]="$st"
+    [[ "$st" == "OK" ]] && okcount=$((okcount+1))
+    done=$((done+1))
+    progress_bar "$okcount" "$done" "$total" "$lbl"
+  done
+  echo
 
   wait
   sem_close
+  exec 3>&- 3<&-
+  rm -f "$fifo" 2>/dev/null || true
 
-  # Merge per-host output into run log and set status
-  while IFS= read -r line; do
+  # Append per-host logs into run log (first 200 lines each)
+  for line in "${lines[@]}"; do
     host="$(trim "${line%%,*}")"
+    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
     func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_target "$host" "$(trim "$(echo "$line" | awk -F',' '{print $2}')" )")"
-
-    if [[ "${ST_CONN[$host]:-OK}" == "FAIL" ]]; then
-      ST_KEY["$host"]="SKIP"
-      continue
-    fi
-
-    if [[ -f "$tmpd/$host.key" ]]; then
-      ST_KEY["$host"]="$(cat "$tmpd/$host.key" 2>/dev/null || echo FAIL)"
-    else
-      ST_KEY["$host"]="FAIL"
-    fi
-
-    if [[ "${ST_KEY[$host]}" == "OK" ]]; then
-      log_ok "Key installed on ${func:-HOST} — $target"
-    else
-      log_warn "Key install failed on ${func:-HOST} — $target (see log)"
-    fi
-
+    target="$(ssh_target "$host" "$user")"
     if [[ -f "$tmpd/$host.sshcopy.log" ]]; then
       {
         echo
@@ -473,7 +524,7 @@ step_install_ssh_key() {
         sed -n '1,200p' "$tmpd/$host.sshcopy.log"
       } >>"$RUN_LOG"
     fi
-  done < <(read_hosts)
+  done
 
   rm -rf "$tmpd" 2>/dev/null || true
   return 0
