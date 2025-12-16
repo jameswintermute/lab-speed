@@ -5,25 +5,6 @@
 #
 # This program comes with ABSOLUTELY NO WARRANTY.
 #
-# Expected layout (repo root = same directory as this script):
-#   local/hosts.csv
-#   local/credentials.txt   (or local/creds.txt)
-#   files-to-copy/
-#
-# Backwards-compat also supported:
-#   ./hosts.csv
-#   ./creds.txt
-#   ./credentials.txt
-#
-# v1.1.13:
-#  - Adds connectivity pre-check with progress bar and concise summary
-#  - Adds colorized log levels ([OK]/[INFO]/[WARN]/[ERROR]) to reduce “wall of errors”
-#
-# v1.1.14 (local):
-#  - Credentials file provides username+password (no hardcoded user)
-#  - Function-first SSH menu (and tries to open new terminal window)
-#  - Stronger RSYNC ssh option handling + per-host summary
-#  - PS1 applied in .bashrc + .bash_profile sourcing
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -40,6 +21,7 @@ MAX_PARALLEL="${LABSPEED_PARALLEL:-8}"
 LOGS_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOGS_DIR"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_LOG="$LOGS_DIR/lab-speed-$RUN_ID.log"
+TMP_RUN_DIR="${LOGS_DIR}/.tmp-${RUN_ID}"; mkdir -p "$TMP_RUN_DIR"
 
 PASS_CACHE=""
 USER_CACHE=""
@@ -87,6 +69,7 @@ on_err() {
   return "$ec"
 }
 trap on_err ERR
+trap 'rm -rf "$TMP_RUN_DIR" 2>/dev/null || true' EXIT
 
 pause() { echo; read -r -p "Press Enter to return to menu..." _ || true; }
 trim() { echo "${1:-}" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'; }
@@ -348,22 +331,10 @@ step_connectivity_check() {
   total="${#lines[@]}"; okcount=0; done=0
   [[ "$total" -eq 0 ]] && { log_warn "No hosts to check."; return 1; }
 
-  log_info "Spawning ${total} connectivity checks (parallel=${MAX_PARALLEL}, timeout=${CONNECT_CHECK_TIMEOUT}s)..."
+  log_info "Running ${total} connectivity checks (timeout=${CONNECT_CHECK_TIMEOUT}s each)..."
 
-  # Parallel checks + live progress bar feedback
-  local tmpd fifo
-  tmpd="$(mktemp -d)"
-  fifo="$tmpd/results.fifo"
-  mkfifo "$fifo"
-
-  # Open FIFO read+write in parent to prevent writer-block deadlocks.
-  exec 3<>"$fifo"
-
-  sem_init
-
-  # show an immediate progress line (so it never "hangs" silently)
-  progress_bar 0 0 "$total" "starting…"
-
+  # IMPORTANT: this step is intentionally SEQUENTIAL for reliability.
+  # Parallel variants were observed to hang on some systems/TTYs.
   local line host user func target label
   for line in "${lines[@]}"; do
     host="$(trim "${line%%,*}")"
@@ -372,58 +343,21 @@ step_connectivity_check() {
     target="$(ssh_target "$host" "$user")"
     label="${func:-host} — ${host}"
 
-    sem_acquire
-    {
-      if probe_host_ok "$target"; then
-        printf "%s	OK	%s
-" "$host" "$label" >"$tmpd/$host.conn"
-        printf "%s	OK	%s
-" "$host" "$label" >&3
-      else
-        printf "%s	FAIL	%s
-" "$host" "$label" >"$tmpd/$host.conn"
-        printf "%s	FAIL	%s
-" "$host" "$label" >&3
-      fi
-      sem_release
-    } &
-  done
-
-  # Read exactly N results for live updates
-  while [[ "$done" -lt "$total" ]]; do
-    local h st lbl
-    IFS=$'	' read -r -u 3 h st lbl || break
-    ST_CONN["$h"]="$st"
-    [[ "$st" == "OK" ]] && okcount=$((okcount+1))
+    if probe_host_ok "$target"; then
+      ST_CONN["$host"]="OK"
+      okcount=$((okcount+1))
+    else
+      ST_CONN["$host"]="FAIL"
+    fi
     done=$((done+1))
-    progress_bar "$okcount" "$done" "$total" "$lbl"
+    progress_bar "$okcount" "$done" "$total" "$label"
   done
   echo
 
-  wait
-  sem_close
-
-  # close fifo fd + cleanup
-  exec 3>&- 3<&-
-  rm -f "$fifo" 2>/dev/null || true
-
-  # Ensure every host has a status (defensive)
-  for line in "${lines[@]}"; do
-    host="$(trim "${line%%,*}")"
-    if [[ -z "${ST_CONN[$host]:-}" ]]; then
-      if [[ -f "$tmpd/$host.conn" ]]; then
-        ST_CONN["$host"]="$(awk -F'	' '{print $2}' "$tmpd/$host.conn" 2>/dev/null | head -n1)"
-      else
-        ST_CONN["$host"]="FAIL"
-      fi
-    fi
-  done
-  rm -rf "$tmpd" 2>/dev/null || true
-
   if [[ "$okcount" -eq "$total" ]]; then
-    log_ok "Connectivity OK: ${okcount}/${total} hosts reachable. (parallel=${MAX_PARALLEL})"
+    log_ok "Connectivity OK: ${okcount}/${total} hosts reachable."
   else
-    log_warn "Connectivity partial: ${okcount}/${total} hosts reachable. (parallel=${MAX_PARALLEL})"
+    log_warn "Connectivity partial: ${okcount}/${total} hosts reachable."
     log_warn "Proceeding anyway (failed hosts will be skipped in later steps)."
   fi
   return 0
@@ -449,16 +383,7 @@ step_install_ssh_key() {
   mapfile -t lines < <(read_hosts)
   total="${#lines[@]}"; okcount=0; done=0
 
-  log_info "Installing keys (parallel=${MAX_PARALLEL})..."
-  progress_bar 0 0 "$total" "starting…"
-
-  local tmpd fifo
-  tmpd="$(mktemp -d)"
-  fifo="$tmpd/keyresults.fifo"
-  mkfifo "$fifo"
-  exec 3<>"$fifo"
-
-  sem_init
+  log_info "Installing keys (sequential; reliable)..."
 
   local line host user func target label
   for line in "${lines[@]}"; do
@@ -475,58 +400,37 @@ step_install_ssh_key() {
       continue
     fi
 
-    sem_acquire
-    {
-      local hlog="$tmpd/$host.sshcopy.log"
-      if sshpass -p "$PASS_CACHE" ssh-copy-id "${keyopt[@]}" \
-          -o StrictHostKeyChecking=accept-new \
-          -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
-          "$target" >"$hlog" 2>&1; then
-        printf "%s	OK	%s
-" "$host" "$label" >"$tmpd/$host.key"
-        printf "%s	OK	%s
-" "$host" "$label" >&3
-      else
-        printf "%s	FAIL	%s
-" "$host" "$label" >"$tmpd/$host.key"
-        printf "%s	FAIL	%s
-" "$host" "$label" >&3
-      fi
-      sem_release
-    } &
-  done
+    local hlog="$TMP_RUN_DIR/$host.sshcopy.log"
+    : >"$hlog" 2>/dev/null || true
 
-  while [[ "$done" -lt "$total" ]]; do
-    local h st lbl
-    IFS=$'	' read -r -u 3 h st lbl || break
-    ST_KEY["$h"]="$st"
-    [[ "$st" == "OK" ]] && okcount=$((okcount+1))
+    if sshpass -p "$PASS_CACHE" ssh-copy-id "${keyopt[@]}" \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+        "$target" >"$hlog" 2>&1; then
+      ST_KEY["$host"]="OK"
+      okcount=$((okcount+1))
+    else
+      ST_KEY["$host"]="FAIL"
+    fi
+
+    # append a short excerpt to run log so failures are actionable
+    {
+      echo
+      echo "----- ssh-copy-id ${func:-HOST} $target -----"
+      sed -n '1,120p' "$hlog"
+    } >>"$RUN_LOG"
+
     done=$((done+1))
-    progress_bar "$okcount" "$done" "$total" "$lbl"
+    progress_bar "$okcount" "$done" "$total" "$label"
   done
   echo
 
-  wait
-  sem_close
-  exec 3>&- 3<&-
-  rm -f "$fifo" 2>/dev/null || true
-
-  # Append per-host logs into run log (first 200 lines each)
-  for line in "${lines[@]}"; do
-    host="$(trim "${line%%,*}")"
-    user="$(trim "$(echo "$line" | awk -F',' '{print $2}')" )"
-    func="$(trim "$(echo "$line" | awk -F',' '{print $3}')" )"
-    target="$(ssh_target "$host" "$user")"
-    if [[ -f "$tmpd/$host.sshcopy.log" ]]; then
-      {
-        echo
-        echo "----- ssh-copy-id ${func:-HOST} $target -----"
-        sed -n '1,200p' "$tmpd/$host.sshcopy.log"
-      } >>"$RUN_LOG"
-    fi
-  done
-
-  rm -rf "$tmpd" 2>/dev/null || true
+  if [[ "$okcount" -eq "$total" ]]; then
+    log_ok "SSH key install OK: ${okcount}/${total} hosts."
+  else
+    log_warn "SSH key install partial: ${okcount}/${total} hosts."
+    log_info "See run log for ssh-copy-id output: $RUN_LOG"
+  fi
   return 0
 }
 
