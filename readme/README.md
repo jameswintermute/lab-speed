@@ -1,15 +1,20 @@
 # lab-speed
-
 A rapid lab setup utility for short‑lived training labs: distribute files to lab hosts and open SSH sessions quickly.
-
 > Designed for **speed**: get connected and ready in minutes.
+
+---
+
+## What's new in v1.2.0
+- **Parallel provisioning** — all hosts are rsynced simultaneously (was sequential). 10 hosts now takes ~8s instead of ~50s.
+- **No password prompts** — SSH sessions (option 2) now use the stored credential automatically, consistent with rsync.
+- **Smarter CSV parsing** — column order in `hosts.csv` no longer matters; columns are found by header name.
+- `sshpass` is now a required dependency (it was previously optional).
 
 ---
 
 ## Fast Start
 
 ### 1) Get the repo
-
 ```bash
 git clone https://github.com/jameswintermute/lab-speed
 cd lab-speed
@@ -17,13 +22,10 @@ chmod +x lab-speed.bin
 ```
 
 ### 2) Fill in `local/credentials.txt`
-
 Run the tool once and it will prompt you (and store with `chmod 600`):
-
 ```bash
 ./lab-speed.bin
 ```
-
 Or edit manually:
 
 `local/credentials.txt`
@@ -31,17 +33,17 @@ Or edit manually:
 # lab-speed credentials (chmod 600)
 username="YOUR_LAB_USERNAME"
 password="YOUR_LAB_PASSWORD"
-SSHPASS="YOUR_LAB_PASSWORD"   # usually same as password
+SSHPASS="YOUR_LAB_PASSWORD"   # must match password
 ```
 
-### 3) Fill in `local/hosts.csv`
+> **Note:** `SSHPASS` is used by all SSH and rsync operations. It is passed via environment variable (not the command line) so it does not appear in the process list.
 
-Required columns:
+### 3) Fill in `local/hosts.csv`
+Required columns (column order does not matter):
 - `external-ip` (or `external_ip`)
 - `function` (friendly label shown in menus)
 
 Example:
-
 ```csv
 host-url,external-ip,internal-ip,function
 https://example-cm,1.2.3.4,10.0.0.1,Splunk-CM
@@ -49,8 +51,7 @@ https://example-idx1,2.3.5.157,10.0.0.2,Splunk-IDX1
 ```
 
 ### 4) Put files you want copied into `files-to-copy/`
-
-Everything in `files-to-copy/` is copied to each lab host:
+Everything in `files-to-copy/` is copied to each lab host.
 
 Remote target:
 ```
@@ -58,23 +59,20 @@ Remote target:
 ```
 
 ### 5) Run **GO!** (menu option 1)
-
 From the menu:
-
 - **1) GO! (install ssh key, RSYNC files)**
 
 This will:
 1. Validate inputs (`hosts.csv`, `credentials.txt`, `files-to-copy/`)
-2. Provision each host by copying `files-to-copy/` → `/tmp/lab-speed/`
+2. Provision **all hosts in parallel** — progress is shown live
 3. Print a clear end summary (how many hosts succeeded) and recommend next steps
 
 ---
 
 ## Menu overview
-
-- **1) GO!** — fast provision all hosts (with a progress meter)
-- **2) SSH to host** — shows a function‑first list, then opens an SSH session (in a new terminal when available)
-- **3) RSYNC again** — re-push `files-to-copy/` to all hosts (progress meter)
+- **1) GO!** — provision all hosts in parallel (rsync + progress meter)
+- **2) SSH to host** — shows a function‑first list, then opens a password‑free SSH session (in a new terminal when available)
+- **3) RSYNC again** — re-push `files-to-copy/` to all hosts in parallel; skips the dependency check for speed
 - **7) Clean up** — remove local credentials file
 
 ---
@@ -85,25 +83,22 @@ This will:
 - `bash`
 - `ssh` (package: `openssh-client`)
 - `rsync`
+- `sshpass` ← required in v1.2.0+
 - `awk`, `sed`
 
-**Recommended / used for non-interactive runs**
-- `sshpass`
-
 ### Install dependencies (Ubuntu/Debian)
-
 ```bash
 sudo apt-get update && sudo apt-get install -y openssh-client rsync gawk sed sshpass
 ```
 
-If you do NOT have admin rights, ask your lab/instructor/admin to install:
+If you do NOT have admin rights, ask your lab instructor or admin to install:
 - `openssh-client`, `rsync`, `gawk`, `sed`, `sshpass`
 
 ---
 
 ## Troubleshooting
 
-### “hostname contains invalid characters”
+### "hostname contains invalid characters"
 Usually caused by hidden `\r` characters in `hosts.csv` (Windows line endings).
 
 Fix:
@@ -115,8 +110,16 @@ sed -i 's/\r$//' local/hosts.csv
 If your terminal emulator opens a new window and closes on exit, that is expected.
 If you want it to stay open, run SSH from the main window (or adjust your terminal profile).
 
+### rsync fails with "unknown option --mkpath"
+The script uses `rsync --mkpath` (rsync ≥ 3.2.3) to create the remote target directory in a single connection. If your rsync is older, the script falls back to a two-step mkdir + rsync automatically — no action needed. To check your version:
+```bash
+rsync --version | head -1
+```
+
+### A host shows as failed but SSH works manually
+Check that the IP in `hosts.csv` is the **external** IP (not internal/private). Also verify the username and password in `local/credentials.txt` are correct. Individual host failures are logged to `logs/lab-speed-<timestamp>.log`.
+
 ---
 
 ## License
-
 GPLv3 — see `LICENSE`.
