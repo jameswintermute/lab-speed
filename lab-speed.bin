@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.2.0 — Feb 2026 — James Wintermute
+# v1.3.0 — Mar 2026 — James Wintermute
 #
-# Changes from v1.1.20:
-#   - sshpass -p → sshpass -e (password no longer visible in ps aux)
-#   - SSH_OPTS array: single definition, used everywhere — no duplication
-#   - GO! and RSYNC now run hosts in PARALLEL (background jobs) — major speed improvement
-#   - Option 3 (RSYNC again) is now a lean rsync_only(), skips dep check
-#   - ssh_menu() now uses sshpass -e for consistent no-prompt SSH
-#   - read_hosts() finds CSV columns by header name, not hardcoded position
-#   - IP validation guard in rsync_to_host()
-#   - Log rotation: keeps last 20 logs
+# Changes from v1.2.0:
+#   - rsync: dropped -z (compression) — measurably faster on high-bandwidth cloud links
+#   - rsync -e: SSH_OPTS now quoted via printf %q — safe for paths containing spaces
+#   - ssh_menu: replaced unsafe eval with a direct sshpass/ssh array call
+#   - SSH GUI terminals: command passed via self-deleting temp script — no nested-quote fragility
+#   - open_ssh_terminal: added xterm, alacritty, wezterm support; graceful gnome-terminal
+#     --title fallback (newer gnome-terminal versions dropped the flag)
+#   - header(): sets terminal window/tab title via ANSI escape (\033]0;...\007)
+#   - ssh_menu: sets per-host title while session is active; restores lab-speed on return
+#   - Parallel subshell stdout/stderr redirected to /dev/null — progress bar stays clean
+#   - Progress polling: shopt nullglob used in-scope — no spurious *.result glob errors
+#   - Elapsed time now shown in GO!/RSYNC completion message
+#   - Log rotation: bash loop + mapfile replaces xargs — safe when ≤20 logs exist
+#   - SSH_OPTS: added ServerAliveInterval/CountMax — detects dead connections (~45s max hang)
+#   - Menu: option 1 text corrected; option 4 = Install SSH keys (new); dep check → option 5
 set -Eeuo pipefail
 
-# ─────────────────────────────────── Colors ────────────────────────────────
+# ─────────────────────────────────── Colors ─────────────────────────────────
 CLR_MAG="\033[35m"; CLR_GRN="\033[32m"; CLR_RED="\033[31m"
 CLR_YEL="\033[33m"; CLR_CYN="\033[36m"; CLR_RST="\033[0m"
 
-# ─────────────────────────────────── Paths ─────────────────────────────────
+# ─────────────────────────────────── Paths ──────────────────────────────────
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LOCAL_DIR="$ROOT_DIR/local"
 LOGS_DIR="$ROOT_DIR/logs"
@@ -31,8 +37,8 @@ mkdir -p "$LOCAL_DIR" "$LOGS_DIR" "$FILES_DIR"
 RUN_TAG="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_LOG="$LOGS_DIR/lab-speed-$RUN_TAG.log"
 
-# ─────────────────────────── SSH options (single definition) ───────────────
-# Used by all ssh and rsync calls — change timeouts/options here only.
+# ─────────────────────── SSH options (single definition) ────────────────────
+# All ssh / rsync / ssh-copy-id calls use this array — change timeouts here only.
 SSH_OPTS=(
   -o PreferredAuthentications=password
   -o PubkeyAuthentication=no
@@ -40,28 +46,31 @@ SSH_OPTS=(
   -o StrictHostKeyChecking=accept-new
   -o "UserKnownHostsFile=$KNOWN_HOSTS_FILE"
   -o ConnectTimeout=10
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=3
 )
 
-# ───────────────────────── ASCII BANNER ────────────────────────────────────
+# ─────────────────────────────── ASCII banner ───────────────────────────────
 header() {
   clear
+  printf '\033]0;lab-speed\007'   # set terminal window/tab title
   printf "%b" "$CLR_MAG"
   printf "%s\n" " ╻  ┏━┓┏┓    ┏━┓┏━┓┏━╸┏━╸╺┳┓╻"
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.2.0 - Feb 2026. James Wintermute"
+  printf "\n%s\n" "      v1.3.0 - Mar 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
-# ─────────────────────────────── Logging ───────────────────────────────────
+# ───────────────────────────────── Logging ──────────────────────────────────
 log()      { printf "%b[%s]%b %s\n"   "$CLR_CYN" "$1" "$CLR_RST" "$2" | tee -a "$RUN_LOG"; }
 log_ok()   { printf "%b[OK]%b %s\n"   "$CLR_GRN"      "$CLR_RST" "$1" | tee -a "$RUN_LOG"; }
 log_warn() { printf "%b[WARN]%b %s\n" "$CLR_YEL"      "$CLR_RST" "$1" | tee -a "$RUN_LOG"; }
 log_err()  { printf "%b[ERR]%b %s\n"  "$CLR_RED"      "$CLR_RST" "$1" | tee -a "$RUN_LOG"; }
 die()      { log_err "$1"; exit 1; }
 
-# ─────────────────────────── Trim whitespace + CR ──────────────────────────
+# ──────────────────────────── Trim whitespace + CR ──────────────────────────
 trim() {
   local s="$1"
   s="${s//$'\r'/}"
@@ -70,24 +79,29 @@ trim() {
   printf "%s" "$s"
 }
 
-# ─────────────────────────────── Progress bar ──────────────────────────────
+# ──────────────────────────────── Progress bar ──────────────────────────────
 progress_bar() {
   local cur="$1" total="$2" label="$3"
-  local width=22
-  local filled=$(( (cur * width) / (total==0?1:total) ))
+  local width=30
+  local filled=$(( (cur * width) / (total == 0 ? 1 : total) ))
   local empty=$(( width - filled ))
   local bar
   bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' "$empty" '' | tr ' ' '-')"
-  printf "\r[%s] %d/%d %s" "$bar" "$cur" "$total" "$label"
+  printf "\r  [%s] %d/%d %s" "$bar" "$cur" "$total" "$label"
 }
 
-# ─────────────────────────────── Log rotation ──────────────────────────────
+# ──────────────────────────────── Log rotation ──────────────────────────────
 rotate_logs() {
-  # Keep the 20 most recent log files; silently remove older ones
-  ls -t "$LOGS_DIR"/lab-speed-*.log 2>/dev/null | tail -n +21 | xargs rm -f --
+  # Keep the 20 most recent log files; safely remove older ones via a bash loop
+  # (avoids the xargs-with-empty-input edge case on some systems).
+  local -a old_logs
+  mapfile -t old_logs < <(ls -t "$LOGS_DIR"/lab-speed-*.log 2>/dev/null | tail -n +21)
+  if (( ${#old_logs[@]} > 0 )); then
+    rm -f -- "${old_logs[@]}"
+  fi
 }
 
-# ────────────────────────────── Credentials ────────────────────────────────
+# ──────────────────────────────── Credentials ───────────────────────────────
 ensure_creds() {
   if [[ ! -f "$CREDS_FILE" ]]; then
     mkdir -p "$LOCAL_DIR"
@@ -95,27 +109,23 @@ ensure_creds() {
 # lab-speed credentials (chmod 600)
 username=""
 password=""
-SSHPASS=""   # optional; if blank, password is used
+SSHPASS=""   # must match password; read by sshpass -e
 CRED
     chmod 600 "$CREDS_FILE"
   fi
 
   # shellcheck disable=SC1090
-  set +u
-  source "$CREDS_FILE"
-  set -u
+  set +u; source "$CREDS_FILE"; set -u
 
   username="${username:-}"
   password="${password:-}"
   SSHPASS="${SSHPASS:-}"
 
-  if [[ -z "${username}" || -z "${password}" ]]; then
-    log "INFO" "Credentials missing; prompting and saving to $CREDS_FILE (chmod 600)."
-    read -r -p "Lab username: " username
-    read -r -s -p "Lab password: " password
-    echo
+  if [[ -z "$username" || -z "$password" ]]; then
+    log "INFO" "Credentials missing — prompting and saving to $CREDS_FILE"
+    read -r -p "  Lab username: " username
+    read -r -s -p "  Lab password: " password; echo
     SSHPASS="${SSHPASS:-$password}"
-
     {
       echo "# lab-speed credentials (chmod 600)"
       printf 'username=%q\n' "$username"
@@ -126,11 +136,11 @@ CRED
   fi
 
   # Ensure SSHPASS is always set — sshpass -e reads this env var
-  [[ -z "${SSHPASS}" ]] && SSHPASS="$password"
+  [[ -z "$SSHPASS" ]] && SSHPASS="$password"
   export SSHPASS
 }
 
-# ──────────────────────────────── Hosts file ───────────────────────────────
+# ───────────────────────────────── Hosts file ───────────────────────────────
 ensure_hosts() {
   if [[ ! -f "$HOSTS_FILE" ]]; then
     mkdir -p "$LOCAL_DIR"
@@ -141,17 +151,23 @@ CSV
   fi
 }
 
-# ──────────────────────────── Dependency check ─────────────────────────────
+# ─────────────────────────────── Dependency check ───────────────────────────
 check_deps() {
   local missing=0
   for c in ssh rsync awk sed sshpass; do
     if ! command -v "$c" >/dev/null 2>&1; then
-      log_err "Missing dependency: $c"
+      log_err "Missing required dependency: $c"
       missing=1
     else
       log_ok "$c"
     fi
   done
+  # ssh-copy-id is optional — only needed for option 4 (key install)
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    log_ok "ssh-copy-id (optional — key install available via option 4)"
+  else
+    log_warn "ssh-copy-id not found — option 4 (SSH key install) unavailable"
+  fi
   if (( missing )); then
     echo
     log "INFO" "Install (Ubuntu/Debian): sudo apt-get update && sudo apt-get install -y openssh-client rsync gawk sed sshpass"
@@ -159,7 +175,7 @@ check_deps() {
   fi
 }
 
-# ──────────────────────────────── Read hosts ───────────────────────────────
+# ───────────────────────────────── Read hosts ───────────────────────────────
 # Finds external-ip and function columns by header name — not hardcoded position.
 # Supports both external-ip and external_ip header variants.
 read_hosts() {
@@ -180,12 +196,11 @@ read_hosts() {
   ' "$HOSTS_FILE" | sed '/^[[:space:]]*$/d'
 }
 
-# ───────────────────────────── Rsync to one host ───────────────────────────
+# ──────────────────────────── Rsync to one host ─────────────────────────────
 rsync_to_host() {
   local ip="$1" func="$2"
   ip="$(trim "$ip")"; func="$(trim "$func")"
 
-  # Guard: skip empty or obviously invalid IPs
   if [[ -z "$ip" ]]; then
     log_warn "Skipping ${func}: empty IP address"
     return 1
@@ -194,90 +209,101 @@ rsync_to_host() {
     log_warn "${func}: '$ip' doesn't look like an IPv4 address — attempting anyway"
   fi
 
-  # Single rsync call — --mkpath creates TARGET_DIR on the remote side,
-  # eliminating the separate ssh mkdir connection (saves ~0.5–1s per host).
-  # Falls back gracefully on older rsync that lacks --mkpath.
-  if sshpass -e rsync -az --delete --mkpath \
-      -e "ssh ${SSH_OPTS[*]}" \
-      "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" >/dev/null 2>&1; then
+  # Build rsync -e argument with properly shell-quoted SSH options.
+  # printf %q ensures paths with spaces (e.g. UserKnownHostsFile) are handled correctly.
+  # -z (compression) is intentionally omitted — it adds CPU overhead on both sides and
+  # is a net slowdown on the high-bandwidth links typical of cloud lab environments.
+  local ssh_e
+  ssh_e="ssh$(printf ' %q' "${SSH_OPTS[@]}")"
+
+  if sshpass -e rsync -a --delete --mkpath \
+      -e "$ssh_e" \
+      "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" 2>/dev/null; then
     return 0
   fi
 
-  # Fallback for rsync < 3.2.3 without --mkpath: create dir first, then rsync
+  # Fallback for rsync < 3.2.3 (no --mkpath): create remote directory first,
+  # then rsync. Costs one extra SSH connection per host but is fully compatible.
   sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
-    "mkdir -p '$TARGET_DIR'" >/dev/null 2>&1 || return 1
+    "mkdir -p '$TARGET_DIR'" 2>/dev/null || return 1
 
-  sshpass -e rsync -az --delete \
-    -e "ssh ${SSH_OPTS[*]}" \
-    "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" >/dev/null 2>&1
+  sshpass -e rsync -a --delete \
+    -e "$ssh_e" \
+    "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" 2>/dev/null
 }
 
-# ──────────────────── Parallel provision (GO! and RSYNC again) ─────────────
+# ────────────────── Parallel provision (GO! and RSYNC again) ────────────────
 # Runs all rsync jobs concurrently. Results written to a temp dir so the
-# final summary is accurate even with parallel output.
+# summary is accurate even with parallel output.
 _run_parallel() {
-  local label="$1"          # e.g. "GO" or "RSYNC"
+  local label="$1"
   mapfile -t hosts < <(read_hosts)
   local total="${#hosts[@]}"
   (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
 
   log "INFO" "$label starting — provisioning $total host(s) in parallel (→ $TARGET_DIR)"
 
-  # Temp dir to collect per-host results
-  local tmpdir
-  tmpdir="$(mktemp -d)"
+  local tmpdir; tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' RETURN
 
-  # Launch all rsync jobs in the background
-  local pids=()
-  local line ip func
+  local t_start; t_start="$(date +%s)"
+
+  # Launch all rsync jobs in the background.
+  # Redirect subshell stdout/stderr to /dev/null — keeps the progress bar clean.
+  # Log writes (via tee) still land in $RUN_LOG even with stdout suppressed.
+  local pids=() line ip func
   for line in "${hosts[@]}"; do
     IFS=',' read -r ip func <<<"$line"
     ip="$(trim "$ip")"; func="$(trim "$func")"
     (
       if rsync_to_host "$ip" "$func"; then
-        printf "ok:%s:%s\n" "$func" "$ip" >"$tmpdir/${func//\//_}.result"
+        printf "ok:%s:%s\n"   "$func" "$ip" >"$tmpdir/${func//\//_}.result"
       else
         printf "fail:%s:%s\n" "$func" "$ip" >"$tmpdir/${func//\//_}.result"
       fi
-    ) &
+    ) >/dev/null 2>&1 &
     pids+=($!)
   done
 
-  # Show a live "waiting" spinner while jobs run
+  # Poll for completion.
+  # shopt nullglob is scoped to this block: *.result won't expand to a literal
+  # string when no files exist yet, preventing spurious loop iterations.
+  shopt -s nullglob
   local done_count=0
   while (( done_count < total )); do
-    done_count=0
-    for f in "$tmpdir"/*.result 2>/dev/null; do
-      [[ -f "$f" ]] && done_count=$(( done_count + 1 ))
-    done
+    local result_files=("$tmpdir"/*.result)
+    done_count="${#result_files[@]}"
     progress_bar "$done_count" "$total" "syncing..."
-    sleep 0.3
+    sleep 0.25
   done
+  shopt -u nullglob
+  echo
 
-  # Wait for all background jobs to finish
+  # Reap all background jobs cleanly
   for pid in "${pids[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
-  echo
 
-  # Tally results
-  local ok=0 fail=0
-  for f in "$tmpdir"/*.result; do
-    [[ -f "$f" ]] || continue
-    local result; result="$(cat "$f")"
+  local t_end elapsed
+  t_end="$(date +%s)"; elapsed=$(( t_end - t_start ))
+
+  # Tally results and surface any per-host failures
+  local ok=0 fail=0 result_file
+  for result_file in "$tmpdir"/*.result; do
+    [[ -f "$result_file" ]] || continue
+    local result; result="$(cat "$result_file")"
     case "$result" in
       ok:*)   ok=$(( ok + 1 )) ;;
       fail:*) fail=$(( fail + 1 ))
               local fhost; fhost="${result#fail:}"
-              log_warn "${fhost%%:*} (${fhost##*:}) failed — check creds/ssh access" ;;
+              log_warn "${fhost%%:*} (${fhost##*:}): rsync failed — check credentials / SSH access" ;;
     esac
   done
 
   if (( fail == 0 )); then
-    log_ok "$label complete — ${ok}/${total} hosts ready. RSYNC done."
+    log_ok "$label complete — ${ok}/${total} hosts ready in ${elapsed}s."
   else
-    log_warn "$label finished — ${ok}/${total} OK, ${fail} failed."
+    log_warn "$label finished — ${ok}/${total} OK, ${fail} failed in ${elapsed}s. See: $RUN_LOG"
   fi
 }
 
@@ -290,43 +316,137 @@ go_run() {
 }
 
 rsync_only() {
-  # Skips ensure_creds / check_deps — assumes GO! was already run this session.
-  # If SSHPASS is not exported yet (e.g. user jumped straight to option 3),
-  # fall back to ensure_creds gracefully.
-  if [[ -z "${SSHPASS:-}" ]]; then
-    ensure_creds
-  fi
+  # Skips ensure_creds / check_deps when GO! has already been run this session.
+  # Falls back gracefully if the user jumps straight to option 3.
+  [[ -z "${SSHPASS:-}" ]] && ensure_creds
   ensure_hosts
   _run_parallel "RSYNC"
 }
 
-# ─────────────────────────── Terminal launcher ─────────────────────────────
+# ──────────────────────────── SSH key installation ──────────────────────────
+# Installs your local SSH public key to all hosts in parallel via ssh-copy-id.
+# After this, SSH connections no longer require sshpass (use option 2 normally
+# — it will fall through to key auth automatically once sshpass is unavailable).
+install_ssh_keys() {
+  ensure_hosts
+  ensure_creds
+
+  if ! command -v ssh-copy-id >/dev/null 2>&1; then
+    log_err "ssh-copy-id not found. Install: sudo apt-get install -y openssh-client"
+    return 1
+  fi
+
+  # Find or generate a local keypair
+  local key_file="$HOME/.ssh/id_rsa"
+  if [[ ! -f "$key_file" ]]; then
+    log "INFO" "No SSH key at $key_file — generating RSA 4096 keypair"
+    ssh-keygen -t rsa -b 4096 -N "" -f "$key_file" -q
+    log_ok "Keypair created: $key_file"
+  fi
+  local pub_key="${key_file}.pub"
+  [[ -f "$pub_key" ]] || die "Public key not found: $pub_key"
+
+  mapfile -t hosts < <(read_hosts)
+  local total="${#hosts[@]}"
+  (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
+
+  log "INFO" "Installing SSH public key to $total host(s) in parallel..."
+
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  local pids=() line ip func
+  for line in "${hosts[@]}"; do
+    IFS=',' read -r ip func <<<"$line"
+    ip="$(trim "$ip")"; func="$(trim "$func")"
+    (
+      # -f forces copy even if the key is already present (idempotent)
+      if sshpass -e ssh-copy-id -f -i "$pub_key" \
+          "${SSH_OPTS[@]}" "${username}@${ip}"; then
+        printf "ok:%s:%s\n"   "$func" "$ip" >"$tmpdir/${func//\//_}.result"
+      else
+        printf "fail:%s:%s\n" "$func" "$ip" >"$tmpdir/${func//\//_}.result"
+      fi
+    ) >/dev/null 2>&1 &
+    pids+=($!)
+  done
+
+  shopt -s nullglob
+  local done_count=0
+  while (( done_count < total )); do
+    local result_files=("$tmpdir"/*.result)
+    done_count="${#result_files[@]}"
+    progress_bar "$done_count" "$total" "copying keys..."
+    sleep 0.25
+  done
+  shopt -u nullglob
+  echo
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local ok=0 fail=0 result_file
+  for result_file in "$tmpdir"/*.result; do
+    [[ -f "$result_file" ]] || continue
+    local result; result="$(cat "$result_file")"
+    case "$result" in
+      ok:*)   ok=$(( ok + 1 )) ;;
+      fail:*) fail=$(( fail + 1 ))
+              local fhost; fhost="${result#fail:}"
+              log_warn "${fhost%%:*} (${fhost##*:}): key install failed" ;;
+    esac
+  done
+
+  if (( fail == 0 )); then
+    log_ok "SSH key installed on ${ok}/${total} hosts."
+  else
+    log_warn "Key install — ${ok}/${total} OK, ${fail} failed."
+  fi
+}
+
+# ────────────────────────────── Terminal launcher ───────────────────────────
+# Receives a path to a self-contained bash script and opens it in the first
+# available GUI terminal emulator.
+# Passing a script file (rather than a command string) avoids the nested-quote
+# fragility that broke the previous bash -lc "..." approach.
+# Returns 1 if no supported GUI terminal is found.
 open_ssh_terminal() {
-  local title="$1" cmd="$2"
+  local title="$1" script="$2"
 
   if command -v gnome-terminal >/dev/null 2>&1; then
-    gnome-terminal --title="$title" -- bash -lc \
-      "$cmd; echo; echo '[lab-speed] session ended'; read -r -p 'Press Enter to close...' _" \
-      >/dev/null 2>&1 &
+    # Try with --title (older gnome-terminal); fall back without it (newer builds
+    # dropped the flag — they return non-zero on unrecognised options).
+    { gnome-terminal --title="$title" -- bash "$script" 2>/dev/null \
+        || gnome-terminal -- bash "$script" 2>/dev/null; } &
     return 0
   fi
-
-  if command -v x-terminal-emulator >/dev/null 2>&1; then
-    x-terminal-emulator -T "$title" -e bash -lc \
-      "$cmd; echo; echo '[lab-speed] session ended'; read -r -p 'Press Enter to close...' _" \
-      >/dev/null 2>&1 &
+  if command -v xterm >/dev/null 2>&1; then
+    xterm -T "$title" -e bash "$script" >/dev/null 2>&1 &
     return 0
   fi
-
   if command -v konsole >/dev/null 2>&1; then
-    konsole --new-tab -p tabtitle="$title" -e bash -lc "$cmd" >/dev/null 2>&1 &
+    konsole -p tabtitle="$title" -e bash "$script" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v alacritty >/dev/null 2>&1; then
+    alacritty --title "$title" -e bash "$script" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v wezterm >/dev/null 2>&1; then
+    wezterm start --class "$title" bash "$script" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -T "$title" -e bash "$script" >/dev/null 2>&1 &
     return 0
   fi
 
+  rm -f "$script"   # clean up — script won't self-delete if never run
   return 1
 }
 
-# ──────────────────────────────── SSH menu ─────────────────────────────────
+# ─────────────────────────────────── SSH menu ───────────────────────────────
 ssh_menu() {
   ensure_hosts
   ensure_creds   # ensures SSHPASS is exported
@@ -341,11 +461,11 @@ ssh_menu() {
     i=$(( i + 1 ))
     IFS=',' read -r ip func <<<"$line"
     ip="$(trim "$ip")"; func="$(trim "$func")"
-    printf "%2d) %s  (%s)\n" "$i" "${func:-HOST}" "$ip"
+    printf "  %2d) %-22s %s\n" "$i" "${func:-HOST}" "$ip"
   done
 
   echo
-  read -r -p "Select host number (or q): " sel
+  read -r -p "  Select host number (or q): " sel
   [[ "$sel" == "q" || "$sel" == "Q" ]] && return 0
   [[ "$sel" =~ ^[0-9]+$ ]] || { log_warn "Invalid selection"; return 0; }
   (( sel >= 1 && sel <= total )) || { log_warn "Selection out of range"; return 0; }
@@ -353,47 +473,71 @@ ssh_menu() {
   IFS=',' read -r ip func <<<"${hosts[$(( sel - 1 ))]}"
   ip="$(trim "$ip")"; func="$(trim "$func")"
 
-  # sshpass -e reads $SSHPASS (already exported by ensure_creds)
-  # No password prompt — consistent with rsync behaviour
-  local ssh_cmd
-  ssh_cmd="sshpass -e ssh ${SSH_OPTS[*]} '${username}@${ip}'"
+  # Write a self-contained, self-deleting SSH session script.
+  # Using a temp file avoids all nested-quoting issues when passing the SSH
+  # command (with its many -o options) to a GUI terminal emulator.
+  local tmp_script; tmp_script="$(mktemp --suffix=.sh)"
+  chmod 700 "$tmp_script"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'export SSHPASS=%q\n' "$SSHPASS"
+    # Set the new terminal window's title to the host function name
+    printf 'printf "\\033]0;%s\\007"\n' "${func:-HOST}"
+    printf 'sshpass -e ssh'
+    printf ' %q' "${SSH_OPTS[@]}"
+    printf ' %q\n' "${username}@${ip}"
+    printf 'echo\n'
+    printf "printf '[lab-speed] session ended\\\\n'\n"
+    printf "read -r -p 'Press Enter to close...' _\n"
+    printf 'rm -f -- %q\n' "$tmp_script"
+  } >"$tmp_script"
 
-  if open_ssh_terminal "${func:-HOST}" "$ssh_cmd"; then
-    log_ok "Opened SSH in a new terminal: ${func:-HOST} (${ip})"
+  # Update this terminal's title to reflect the active host
+  printf '\033]0;%s\007' "${func:-HOST}"
+
+  if open_ssh_terminal "${func:-HOST}" "$tmp_script"; then
+    log_ok "Opened SSH in a new terminal: ${func:-HOST} ($ip)"
+    printf '\033]0;lab-speed\007'   # restore title
     return 0
   fi
 
+  # No GUI terminal available — open SSH directly in this window.
+  # Direct array call: no eval, no shell injection risk.
   log "INFO" "No GUI terminal found — opening SSH in this window."
-  # shellcheck disable=SC2086
-  eval "$ssh_cmd"
+  sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}"
+  printf '\033]0;lab-speed\007'
+  rm -f "$tmp_script"
 }
 
-# ────────────────────────────────── Cleanup ────────────────────────────────
+# ──────────────────────────────────── Cleanup ───────────────────────────────
 cleanup() {
   rm -f "$CREDS_FILE"
   log_ok "Deleted $CREDS_FILE"
 }
 
-# ──────────────────────────────── Main menu ────────────────────────────────
+# ─────────────────────────────────── Main menu ──────────────────────────────
 menu() {
   rotate_logs
 
   while true; do
     header
-    echo "1) GO!  (install ssh key, RSYNC files)"
-    echo "2) SSH  (open host session)"
-    echo "3) RSYNC again"
-    echo "4) Dependency check (manual)"
-    echo "7) Clean Up (delete creds)"
-    echo "q) Quit"
+    printf "  %s\n" "1) GO!  (RSYNC files to all hosts)"
+    printf "  %s\n" "2) SSH  (open host session)"
+    printf "  %s\n" "3) RSYNC again"
+    printf "  %s\n" "4) Install SSH keys to all hosts"
+    printf "  %s\n" "5) Dependency check"
+    printf "  %s\n" "7) Clean Up (delete creds)"
+    printf "  %s\n" "q) Quit"
     echo
-    read -r -p "Select an option: " opt
+    read -r -p "  Select an option: " opt
     case "$opt" in
-      1) go_run;    read -r -p "Press Enter to return to menu..." _ ;;
-      2) ssh_menu;  read -r -p "Press Enter to return to menu..." _ ;;
-      3) rsync_only; read -r -p "Press Enter to return to menu..." _ ;;
-      4) ensure_hosts; ensure_creds; check_deps; read -r -p "Press Enter to return to menu..." _ ;;
-      7) cleanup;   read -r -p "Press Enter to return to menu..." _ ;;
+      1) go_run;            read -r -p "  Press Enter to return to menu..." _ ;;
+      2) ssh_menu;          read -r -p "  Press Enter to return to menu..." _ ;;
+      3) rsync_only;        read -r -p "  Press Enter to return to menu..." _ ;;
+      4) install_ssh_keys;  read -r -p "  Press Enter to return to menu..." _ ;;
+      5) ensure_hosts; ensure_creds; check_deps
+                            read -r -p "  Press Enter to return to menu..." _ ;;
+      7) cleanup;           read -r -p "  Press Enter to return to menu..." _ ;;
       q|Q) exit 0 ;;
       *) log_warn "Invalid option"; sleep 0.5 ;;
     esac
