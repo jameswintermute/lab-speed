@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.4.0 — May 2026 — James Wintermute
+# v1.5.0 — May 2026 — James Wintermute
 #
-# Changes from v1.3.0:
+# Changes from v1.4.0:
+#   - NEW: Option 8 = Broadcast — opens tmux in a new terminal with one pane per
+#     host, synchronize-panes ON by default. Type once, hit every host. Pane
+#     borders show the function name. Toggle sync with Ctrl-b :setw
+#     synchronize-panes off.  Requires tmux.
+#   - NEW: Option 9 = Health check — parallel SSH to every host, reports
+#     hostname, uptime, free disk on /, free mem, Splunk status + version.
+#     Renders a clean table. Useful right after GO! to catch silent failures
+#     (rsync OK but host otherwise broken) before you waste 90 minutes.
+#   - check_deps: tmux added as optional (warns, doesn't fail) — needed only
+#     for option 8.
+#
+# Changes from v1.3.0 (kept for reference):
 #   - FIX: RETURN trap on local tmpdir crashed under `set -u` ("line 310: tmpdir:
 #     unbound variable") — the single-quoted trap expanded $tmpdir in the caller's
 #     scope after the local had gone out of scope. Trap now uses double quotes so
-#     $tmpdir is baked in at trap-definition time. Affected go_run/rsync_only
-#     (via _run_parallel) and install_ssh_keys.
-#   - NEW: After rsync, files on remote hosts are chmod -R 777 — convenient for
-#     lab work where students may need to read/edit/execute everything without
-#     fighting permissions. User is informed once per run (not per host).
-#   - NEW: Option 6 = URLs — lists the host-url column from local/hosts.csv,
-#     numbered alongside the function name, so lab web UIs can be opened quickly.
-#   - Menu: option 6 inserted between SSH-keys and Dependency-check.
+#     $tmpdir is baked in at trap-definition time.
+#   - NEW: After rsync, files on remote hosts are chmod -R 777.
+#   - NEW: Option 6 = URLs — lists the host-url column from local/hosts.csv.
 set -Eeuo pipefail
 
 # ─────────────────────────────────── Colors ─────────────────────────────────
@@ -56,7 +63,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.4.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.5.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -164,6 +171,12 @@ check_deps() {
     log_ok "ssh-copy-id (optional — key install available via option 4)"
   else
     log_warn "ssh-copy-id not found — option 4 (SSH key install) unavailable"
+  fi
+  # tmux is optional — only needed for option 8 (broadcast)
+  if command -v tmux >/dev/null 2>&1; then
+    log_ok "tmux (optional — broadcast available via option 8)"
+  else
+    log_warn "tmux not found — option 8 (Broadcast) unavailable"
   fi
   if (( missing )); then
     echo
@@ -573,6 +586,230 @@ ssh_menu() {
   rm -f "$tmp_script"
 }
 
+# ──────────────────────────── Broadcast (tmux) ──────────────────────────────
+# Opens tmux in a new GUI terminal with one pane per host, all running ssh.
+# synchronize-panes is ON by default — keystrokes hit every host at once.
+# Toggle off inside tmux with:  Ctrl-b :setw synchronize-panes off
+# Detach with Ctrl-b d, kill the session with Ctrl-b : kill-session.
+broadcast_tmux() {
+  ensure_hosts
+  ensure_creds
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    log_err "tmux not found. Install: sudo apt-get install -y tmux"
+    return 1
+  fi
+
+  mapfile -t hosts < <(read_hosts)
+  local total="${#hosts[@]}"
+  (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
+
+  log "INFO" "Opening tmux broadcast across $total host(s)..."
+  log "INFO" "Sync ON by default. Toggle: Ctrl-b :setw synchronize-panes off"
+
+  # We avoid the tmux + bash -c + nested-quoting nightmare by writing one
+  # small launcher script per host and pointing tmux at it. This mirrors how
+  # ssh_menu already handles the same problem.
+  local bdir; bdir="$(mktemp -d --suffix=.lab-bcast)"
+  chmod 700 "$bdir"
+
+  # Per-host launcher scripts. `; exec bash -i` keeps the pane open if the
+  # ssh dies, so a single failure doesn't tear down the whole session.
+  local i=0 line ip func host_script
+  declare -a host_scripts=()
+  declare -a pane_titles=()
+  for line in "${hosts[@]}"; do
+    i=$(( i + 1 ))
+    IFS=',' read -r ip func <<<"$line"
+    ip="$(trim "$ip")"; func="$(trim "$func")"
+    host_script="$bdir/host-${i}.sh"
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf 'export SSHPASS=%q\n' "$SSHPASS"
+      printf 'printf "\\033]0;%s\\007"\n' "${func:-HOST}"
+      printf 'sshpass -e ssh'
+      printf ' %q' "${SSH_OPTS[@]}"
+      printf ' %q\n' "${username}@${ip}"
+      printf 'echo\n'
+      printf 'printf "[lab-speed] %s session ended\\n"\n' "${func:-HOST}"
+      printf 'exec bash -i\n'
+    } >"$host_script"
+    chmod 700 "$host_script"
+    host_scripts+=("$host_script")
+    pane_titles+=("${func:-HOST}")
+  done
+
+  # The top-level launcher: builds the tmux session and attaches.
+  local tmp_script; tmp_script="$(mktemp --suffix=.sh)"
+  chmod 700 "$tmp_script"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -u\n'
+    printf 'SESSION=lab-speed-bcast-$$\n'
+    printf 'printf "\\033]0;lab-speed broadcast\\007"\n\n'
+    printf 'cat <<BANNER\n'
+    printf '======================================\n'
+    printf ' lab-speed broadcast — %d host(s)\n' "$total"
+    printf '======================================\n'
+    printf ' Sync is ON by default — type once,\n'
+    printf ' hit every host.\n\n'
+    printf ' Toggle sync : Ctrl-b :setw synchronize-panes\n'
+    printf ' Cycle panes : Ctrl-b o\n'
+    printf ' Zoom pane   : Ctrl-b z\n'
+    printf ' Detach      : Ctrl-b d\n'
+    printf ' Kill all    : Ctrl-b : kill-session\n'
+    printf '======================================\n'
+    printf 'BANNER\n'
+    printf 'sleep 1\n\n'
+
+    # First pane: create the session
+    printf 'tmux new-session -d -s "$SESSION" -n hosts bash %q\n' "${host_scripts[0]}"
+    printf 'tmux select-pane -t "$SESSION:hosts.0" -T %q\n' "${pane_titles[0]}"
+
+    # Remaining panes: split + tile
+    local k
+    for (( k=1; k<total; k++ )); do
+      printf 'tmux split-window -t "$SESSION:hosts" bash %q\n' "${host_scripts[$k]}"
+      printf 'tmux select-pane -T %q\n' "${pane_titles[$k]}"
+      printf 'tmux select-layout -t "$SESSION:hosts" tiled >/dev/null\n'
+    done
+
+    # Pane border titles, sync, final tile, attach
+    printf '\ntmux set -t "$SESSION" pane-border-status top\n'
+    printf 'tmux set -t "$SESSION" pane-border-format " #{pane_title} "\n'
+    printf 'tmux setw -t "$SESSION:hosts" synchronize-panes on\n'
+    printf 'tmux select-layout -t "$SESSION:hosts" tiled >/dev/null\n'
+    printf 'tmux attach -t "$SESSION"\n\n'
+    printf 'echo\n'
+    printf "printf '[lab-speed] broadcast session ended\\\\n'\n"
+    printf "read -r -p 'Press Enter to close...' _\n"
+    # Clean up the per-host scripts and self
+    printf 'rm -rf -- %q\n' "$bdir"
+    printf 'rm -f -- %q\n' "$tmp_script"
+  } >"$tmp_script"
+
+  if open_ssh_terminal "lab-speed broadcast" "$tmp_script"; then
+    log_ok "Opened tmux broadcast in a new terminal ($total panes)."
+    return 0
+  fi
+
+  # No GUI terminal — run tmux directly in this window
+  log "INFO" "No GUI terminal found — running tmux in this window."
+  bash "$tmp_script"
+}
+
+# ───────────────────────────── Health check ─────────────────────────────────
+# Parallel SSH to every host; reports hostname, uptime, free disk on /,
+# free mem, Splunk status + version. Useful right after GO! to catch silent
+# failures (rsync OK but host otherwise broken).
+health_check() {
+  ensure_hosts
+  ensure_creds
+
+  mapfile -t hosts < <(read_hosts)
+  local total="${#hosts[@]}"
+  (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
+
+  log "INFO" "Health-checking $total host(s) in parallel..."
+
+  local tmpdir; tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+
+  # Remote probe — kept POSIX-ish, single line, no heredoc fragility.
+  # Output is one CSV line: func,host,uptime,disk_free,mem_free,splunk_status,splunk_ver
+  # Any field that can't be determined → "?"
+  local remote_cmd
+  remote_cmd='
+    h=$(hostname -s 2>/dev/null || echo "?");
+    up=$(uptime -p 2>/dev/null | sed "s/^up //" || echo "?");
+    disk=$(df -h / 2>/dev/null | awk "NR==2 {print \$4}" || echo "?");
+    mem=$(free -h 2>/dev/null | awk "/^Mem:/ {print \$7}" || echo "?");
+    if pgrep -x splunkd >/dev/null 2>&1; then sp="up"; else sp="down"; fi;
+    if [ -x /opt/splunk/bin/splunk ]; then
+      sv=$(/opt/splunk/bin/splunk version 2>/dev/null | head -1 | awk "{print \$2}");
+    else
+      sv="-";
+    fi;
+    [ -z "$sv" ] && sv="?";
+    printf "%s|%s|%s|%s|%s|%s\n" "$h" "$up" "$disk" "$mem" "$sp" "$sv"
+  '
+
+  local pids=() line ip func
+  for line in "${hosts[@]}"; do
+    IFS=',' read -r ip func <<<"$line"
+    ip="$(trim "$ip")"; func="$(trim "$func")"
+    (
+      local out
+      if out=$(sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
+                "$remote_cmd" 2>/dev/null); then
+        printf "ok|%s|%s|%s\n" "$func" "$ip" "$out" >"$tmpdir/${func//\//_}.result"
+      else
+        printf "fail|%s|%s|||||\n" "$func" "$ip" >"$tmpdir/${func//\//_}.result"
+      fi
+    ) >/dev/null 2>&1 &
+    pids+=($!)
+  done
+
+  shopt -s nullglob
+  local done_count=0
+  while (( done_count < total )); do
+    local result_files=("$tmpdir"/*.result)
+    done_count="${#result_files[@]}"
+    progress_bar "$done_count" "$total" "checking..."
+    sleep 0.25
+  done
+  shopt -u nullglob
+  echo
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Render results table
+  echo
+  printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9s %s\n" \
+    "FUNC" "IP" "HOSTNAME" "UPTIME" "DISK/" "MEM" "SPLUNK" "VER"
+  printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9s %s\n" \
+    "----" "--" "--------" "------" "-----" "---" "------" "---"
+
+  local result_file ok=0 fail=0
+  # Sort by function name so output order is stable across runs
+  for result_file in $(ls "$tmpdir"/*.result 2>/dev/null | sort); do
+    [[ -f "$result_file" ]] || continue
+    local raw; raw="$(cat "$result_file")"
+    local status func2 ip2 host up disk mem sp sv
+    IFS='|' read -r status func2 ip2 host up disk mem sp sv <<<"$raw"
+
+    if [[ "$status" == "ok" ]]; then
+      ok=$(( ok + 1 ))
+      # Truncate uptime to keep the row tidy
+      [[ ${#up} -gt 14 ]] && up="${up:0:13}…"
+      # Color splunk status
+      local sp_disp="$sp"
+      if [[ "$sp" == "up" ]]; then
+        sp_disp=$(printf "%b%-7s%b" "$CLR_GRN" "up" "$CLR_RST")
+      elif [[ "$sp" == "down" ]]; then
+        sp_disp=$(printf "%b%-7s%b" "$CLR_YEL" "down" "$CLR_RST")
+      fi
+      printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9b %s\n" \
+        "${func2:-?}" "${ip2:-?}" "${host:-?}" "${up:-?}" \
+        "${disk:-?}" "${mem:-?}" "$sp_disp" "${sv:-?}"
+    else
+      fail=$(( fail + 1 ))
+      printf "  %-8s %-15s %b%s%b\n" \
+        "${func2:-?}" "${ip2:-?}" "$CLR_RED" "UNREACHABLE" "$CLR_RST"
+    fi
+  done
+
+  echo
+  if (( fail == 0 )); then
+    log_ok "Health check — ${ok}/${total} hosts reachable."
+  else
+    log_warn "Health check — ${ok}/${total} OK, ${fail} unreachable."
+  fi
+}
+
 # ──────────────────────────────────── Cleanup ───────────────────────────────
 cleanup() {
   rm -f "$CREDS_FILE"
@@ -592,6 +829,8 @@ menu() {
     printf "  %s\n" "5) Dependency check"
     printf "  %s\n" "6) URLs (list lab web URLs)"
     printf "  %s\n" "7) Clean Up (delete creds)"
+    printf "  %s\n" "8) Broadcast (tmux all-hosts session)"
+    printf "  %s\n" "9) Health check (uptime, disk, Splunk status)"
     printf "  %s\n" "q) Quit"
     echo
     read -r -p "  Select an option: " opt
@@ -604,6 +843,8 @@ menu() {
                             read -r -p "  Press Enter to return to menu..." _ ;;
       6) list_urls;         read -r -p "  Press Enter to return to menu..." _ ;;
       7) cleanup;           read -r -p "  Press Enter to return to menu..." _ ;;
+      8) broadcast_tmux;    read -r -p "  Press Enter to return to menu..." _ ;;
+      9) health_check;      read -r -p "  Press Enter to return to menu..." _ ;;
       q|Q) exit 0 ;;
       *) log_warn "Invalid option"; sleep 0.5 ;;
     esac
