@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.3.0 — Mar 2026 — James Wintermute
+# v1.4.0 — May 2026 — James Wintermute
 #
-# Changes from v1.2.0:
-#   - rsync: dropped -z (compression) — measurably faster on high-bandwidth cloud links
-#   - rsync -e: SSH_OPTS now quoted via printf %q — safe for paths containing spaces
-#   - ssh_menu: replaced unsafe eval with a direct sshpass/ssh array call
-#   - SSH GUI terminals: command passed via self-deleting temp script — no nested-quote fragility
-#   - open_ssh_terminal: added xterm, alacritty, wezterm support; graceful gnome-terminal
-#     --title fallback (newer gnome-terminal versions dropped the flag)
-#   - header(): sets terminal window/tab title via ANSI escape (\033]0;...\007)
-#   - ssh_menu: sets per-host title while session is active; restores lab-speed on return
-#   - Parallel subshell stdout/stderr redirected to /dev/null — progress bar stays clean
-#   - Progress polling: shopt nullglob used in-scope — no spurious *.result glob errors
-#   - Elapsed time now shown in GO!/RSYNC completion message
-#   - Log rotation: bash loop + mapfile replaces xargs — safe when ≤20 logs exist
-#   - SSH_OPTS: added ServerAliveInterval/CountMax — detects dead connections (~45s max hang)
-#   - Menu: option 1 text corrected; option 4 = Install SSH keys (new); dep check → option 5
+# Changes from v1.3.0:
+#   - FIX: RETURN trap on local tmpdir crashed under `set -u` ("line 310: tmpdir:
+#     unbound variable") — the single-quoted trap expanded $tmpdir in the caller's
+#     scope after the local had gone out of scope. Trap now uses double quotes so
+#     $tmpdir is baked in at trap-definition time. Affected go_run/rsync_only
+#     (via _run_parallel) and install_ssh_keys.
+#   - NEW: After rsync, files on remote hosts are chmod -R 777 — convenient for
+#     lab work where students may need to read/edit/execute everything without
+#     fighting permissions. User is informed once per run (not per host).
+#   - NEW: Option 6 = URLs — lists the host-url column from local/hosts.csv,
+#     numbered alongside the function name, so lab web UIs can be opened quickly.
+#   - Menu: option 6 inserted between SSH-keys and Dependency-check.
 set -Eeuo pipefail
 
 # ─────────────────────────────────── Colors ─────────────────────────────────
@@ -59,7 +56,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.3.0 - Mar 2026. James Wintermute"
+  printf "\n%s\n" "      v1.4.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -196,6 +193,53 @@ read_hosts() {
   ' "$HOSTS_FILE" | sed '/^[[:space:]]*$/d'
 }
 
+# ───────────────────────────────── Read URLs ────────────────────────────────
+# Emits "url,function" lines. Column 1 (host-url) is paired with the function
+# column so we can show a friendly label next to each URL.
+read_urls() {
+  awk -F',' '
+    NR==1 {
+      for (i=1; i<=NF; i++) {
+        gsub(/\r/, "", $i)
+        h = tolower($i)
+        if (h == "host-url" || h == "host_url" || h == "url") url_col = i
+        if (h == "function") fn_col = i
+      }
+    }
+    NR>1 && url_col {
+      gsub(/\r/, "", $url_col)
+      if (fn_col) gsub(/\r/, "", $fn_col)
+      if ($url_col != "") print $url_col "," (fn_col ? $fn_col : "")
+    }
+  ' "$HOSTS_FILE" | sed '/^[[:space:]]*$/d'
+}
+
+# ─────────────────────────────────── List URLs ──────────────────────────────
+# Pretty-prints column 1 of local/hosts.csv (the host-url column) numbered and
+# labelled by function — handy for jumping to lab web UIs in a browser.
+list_urls() {
+  ensure_hosts
+
+  mapfile -t rows < <(read_urls)
+  local total="${#rows[@]}"
+  if (( total == 0 )); then
+    log_warn "No URLs found in $HOSTS_FILE (expected a 'host-url' column)."
+    return 0
+  fi
+
+  echo
+  printf "  %s\n" "Lab URLs (from $HOSTS_FILE):"
+  echo
+  local i=0 line url func
+  for line in "${rows[@]}"; do
+    i=$(( i + 1 ))
+    IFS=',' read -r url func <<<"$line"
+    url="$(trim "$url")"; func="$(trim "$func")"
+    printf "  %2d) %-8s %s\n" "$i" "${func:-—}" "$url"
+  done
+  echo
+}
+
 # ──────────────────────────── Rsync to one host ─────────────────────────────
 rsync_to_host() {
   local ip="$1" func="$2"
@@ -219,6 +263,12 @@ rsync_to_host() {
   if sshpass -e rsync -a --delete --mkpath \
       -e "$ssh_e" \
       "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" 2>/dev/null; then
+    # Loosen permissions for lab use — students may need to read/edit/execute
+    # everything without fighting permissions. Best-effort: rsync success is
+    # what we report on; chmod failure is logged but doesn't fail the host.
+    sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
+      "chmod -R 777 '$TARGET_DIR'" 2>/dev/null || \
+      log_warn "${func} (${ip}): rsync OK but chmod 777 failed"
     return 0
   fi
 
@@ -227,9 +277,15 @@ rsync_to_host() {
   sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
     "mkdir -p '$TARGET_DIR'" 2>/dev/null || return 1
 
-  sshpass -e rsync -a --delete \
-    -e "$ssh_e" \
-    "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" 2>/dev/null
+  if sshpass -e rsync -a --delete \
+      -e "$ssh_e" \
+      "$FILES_DIR/" "${username}@${ip}:$TARGET_DIR/" 2>/dev/null; then
+    sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
+      "chmod -R 777 '$TARGET_DIR'" 2>/dev/null || \
+      log_warn "${func} (${ip}): rsync OK but chmod 777 failed"
+    return 0
+  fi
+  return 1
 }
 
 # ────────────────── Parallel provision (GO! and RSYNC again) ────────────────
@@ -242,9 +298,15 @@ _run_parallel() {
   (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
 
   log "INFO" "$label starting — provisioning $total host(s) in parallel (→ $TARGET_DIR)"
+  log "INFO" "Files on remote hosts will be chmod -R 777 for unrestricted lab access."
 
   local tmpdir; tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
+  # NOTE: double-quoted trap — $tmpdir must be expanded at trap-definition time.
+  # If single-quoted, the expansion is deferred until the trap fires, by which
+  # point this `local` has gone out of scope and `set -u` will abort with
+  # "tmpdir: unbound variable" in the caller. (This bit us in v1.3.0.)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
 
   local t_start; t_start="$(date +%s)"
 
@@ -353,7 +415,9 @@ install_ssh_keys() {
   log "INFO" "Installing SSH public key to $total host(s) in parallel..."
 
   local tmpdir; tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
+  # See _run_parallel for why this trap is double-quoted, not single-quoted.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
 
   local pids=() line ip func
   for line in "${hosts[@]}"; do
@@ -526,6 +590,7 @@ menu() {
     printf "  %s\n" "3) RSYNC again"
     printf "  %s\n" "4) Install SSH keys to all hosts"
     printf "  %s\n" "5) Dependency check"
+    printf "  %s\n" "6) URLs (list lab web URLs)"
     printf "  %s\n" "7) Clean Up (delete creds)"
     printf "  %s\n" "q) Quit"
     echo
@@ -537,6 +602,7 @@ menu() {
       4) install_ssh_keys;  read -r -p "  Press Enter to return to menu..." _ ;;
       5) ensure_hosts; ensure_creds; check_deps
                             read -r -p "  Press Enter to return to menu..." _ ;;
+      6) list_urls;         read -r -p "  Press Enter to return to menu..." _ ;;
       7) cleanup;           read -r -p "  Press Enter to return to menu..." _ ;;
       q|Q) exit 0 ;;
       *) log_warn "Invalid option"; sleep 0.5 ;;
