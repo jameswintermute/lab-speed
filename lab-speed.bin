@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.5.0 — May 2026 — James Wintermute
+# v1.6.0 — May 2026 — James Wintermute
+#
+# Changes from v1.5.0:
+#   - NEW: Option m = Mesh SSH keys — sets up host-to-host SSH key auth.
+#     Two modes:
+#       hub-and-spoke (default): one designated hub host can SSH to every
+#                                host (including itself). Useful for running
+#                                cluster commands from the CM/SH across the
+#                                indexers.
+#       full mesh:               every host can SSH to every host.
+#     Complements option 4 (which only sets up laptop → host).
 #
 # Changes from v1.4.0:
-#   - NEW: Option 8 = Broadcast — opens tmux in a new terminal with one pane per
-#     host, synchronize-panes ON by default. Type once, hit every host. Pane
-#     borders show the function name. Toggle sync with Ctrl-b :setw
-#     synchronize-panes off.  Requires tmux.
-#   - NEW: Option 9 = Health check — parallel SSH to every host, reports
-#     hostname, uptime, free disk on /, free mem, Splunk status + version.
-#     Renders a clean table. Useful right after GO! to catch silent failures
-#     (rsync OK but host otherwise broken) before you waste 90 minutes.
-#   - check_deps: tmux added as optional (warns, doesn't fail) — needed only
-#     for option 8.
+#   - NEW: Option 8 = Broadcast — opens tmux in a new terminal with one pane
+#     per host, synchronize-panes ON. Type once, hit every host.
+#   - NEW: Option 9 = Health check — parallel SSH; reports hostname, uptime,
+#     disk, mem, Splunk status + version. Renders a clean table.
 #
 # Changes from v1.3.0 (kept for reference):
-#   - FIX: RETURN trap on local tmpdir crashed under `set -u` ("line 310: tmpdir:
-#     unbound variable") — the single-quoted trap expanded $tmpdir in the caller's
-#     scope after the local had gone out of scope. Trap now uses double quotes so
-#     $tmpdir is baked in at trap-definition time.
+#   - FIX: RETURN trap on local tmpdir crashed under `set -u` ("line 310:
+#     tmpdir: unbound variable") — trap now uses double quotes so $tmpdir is
+#     baked in at trap-definition time.
 #   - NEW: After rsync, files on remote hosts are chmod -R 777.
 #   - NEW: Option 6 = URLs — lists the host-url column from local/hosts.csv.
 set -Eeuo pipefail
@@ -63,7 +66,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.5.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.6.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -810,6 +813,189 @@ health_check() {
   fi
 }
 
+# ──────────────────────────── Mesh SSH keys ─────────────────────────────────
+# Sets up host-to-host SSH key auth. Two modes:
+#   hub-and-spoke: one chosen host can SSH to every host (incl. itself)
+#   full mesh:     every host can SSH to every host
+#
+# Note: option 4 sets up laptop→host. This option sets up host→host, which is
+# what you want for distributed-Splunk lab work (bundle pushes from the CM,
+# diag collection from a SH, etc).
+#
+# Implementation strategy (avoids any private key leaving the lab):
+#   1. SSH to each "source" host (hub or all hosts in mesh mode) and run a
+#      remote script that ensures ~/.ssh/id_rsa exists, then prints its public
+#      key on stdout. The private key never leaves the host.
+#   2. Collect the public keys locally.
+#   3. SSH to each "target" host and append the appropriate public key(s) to
+#      ~/.ssh/authorized_keys, deduping so re-runs are idempotent.
+mesh_ssh_keys() {
+  ensure_hosts
+  ensure_creds
+
+  mapfile -t hosts < <(read_hosts)
+  local total="${#hosts[@]}"
+  (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
+
+  echo
+  printf "  %s\n" "Mesh SSH key setup — host-to-host passwordless SSH"
+  echo
+  printf "  %s\n" "Hosts:"
+  local i=0 line ip func
+  for line in "${hosts[@]}"; do
+    i=$(( i + 1 ))
+    IFS=',' read -r ip func <<<"$line"
+    ip="$(trim "$ip")"; func="$(trim "$func")"
+    printf "  %2d) %-22s %s\n" "$i" "${func:-HOST}" "$ip"
+  done
+
+  echo
+  printf "  %s\n" "Mode:"
+  printf "  %s\n" "  Enter a host number (1-$total) to set up hub-and-spoke from that host"
+  printf "  %s\n" "  Enter 'm' for full mesh (every host → every host)"
+  printf "  %s\n" "  Enter 'q' to cancel"
+  echo
+  read -r -p "  Choice: " choice
+
+  [[ "$choice" == "q" || "$choice" == "Q" ]] && { log "INFO" "Cancelled."; return 0; }
+
+  # Determine source hosts (the ones whose keys get distributed)
+  local -a src_indexes=()
+  if [[ "$choice" == "m" || "$choice" == "M" ]]; then
+    log "INFO" "Mode: full mesh — every host will be able to SSH to every host."
+    log_warn "This means anyone with shell on any host can reach every other host."
+    read -r -p "  Continue? (y/N): " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log "INFO" "Cancelled."; return 0; }
+    for (( i=0; i<total; i++ )); do src_indexes+=("$i"); done
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )); then
+    src_indexes+=("$(( choice - 1 ))")
+    IFS=',' read -r ip func <<<"${hosts[$(( choice - 1 ))]}"
+    func="$(trim "$func")"
+    log "INFO" "Mode: hub-and-spoke from ${func:-HOST} → all ${total} hosts."
+  else
+    log_warn "Invalid choice."
+    return 0
+  fi
+
+  # ── Phase 1: ensure each source host has a keypair, collect public keys ──
+  local tmpdir; tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+
+  # Remote script: idempotent keygen + emit pubkey
+  # Uses RSA 4096 to match option 4's key style.
+  local keygen_cmd
+  keygen_cmd='
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh;
+    if [ ! -f ~/.ssh/id_rsa ]; then
+      ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa -q;
+    fi;
+    cat ~/.ssh/id_rsa.pub
+  '
+
+  log "INFO" "Phase 1/2: generating keys on ${#src_indexes[@]} source host(s)..."
+  local idx src_ip src_func pubkey_file pubkey_count=0
+  for idx in "${src_indexes[@]}"; do
+    IFS=',' read -r src_ip src_func <<<"${hosts[$idx]}"
+    src_ip="$(trim "$src_ip")"; src_func="$(trim "$src_func")"
+    pubkey_file="$tmpdir/${src_func//\//_}.pub"
+    if sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${src_ip}" \
+         "$keygen_cmd" >"$pubkey_file" 2>/dev/null && [[ -s "$pubkey_file" ]]; then
+      log_ok "Key on ${src_func} (${src_ip})"
+      pubkey_count=$(( pubkey_count + 1 ))
+    else
+      log_warn "${src_func} (${src_ip}): keygen/fetch failed — skipping as source"
+      rm -f "$pubkey_file"
+    fi
+  done
+
+  if (( pubkey_count == 0 )); then
+    log_err "No source keys collected — aborting."
+    return 1
+  fi
+
+  # ── Phase 2: install collected pubkeys on every host (parallel) ──
+  log "INFO" "Phase 2/2: installing ${pubkey_count} key(s) on ${total} host(s) in parallel..."
+
+  # Build the combined authorized_keys block once. We'll send it to each host
+  # and have a small remote script append-and-dedupe.
+  local combined_keys; combined_keys="$(cat "$tmpdir"/*.pub 2>/dev/null)"
+  if [[ -z "$combined_keys" ]]; then
+    log_err "No public keys to install — aborting."
+    return 1
+  fi
+
+  # Remote script: append keys, then dedupe authorized_keys in place.
+  # We use a heredoc-fed input so keys with special chars are passed safely.
+  local install_cmd
+  install_cmd='
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh;
+    touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys;
+    cat >> ~/.ssh/authorized_keys;
+    # Dedupe in place, preserving order of first occurrence
+    awk "!seen[\$0]++" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp \
+      && mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys \
+      && chmod 600 ~/.ssh/authorized_keys
+  '
+
+  local pids=() install_ip install_func
+  for line in "${hosts[@]}"; do
+    IFS=',' read -r install_ip install_func <<<"$line"
+    install_ip="$(trim "$install_ip")"; install_func="$(trim "$install_func")"
+    (
+      if printf "%s\n" "$combined_keys" | \
+         sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${install_ip}" \
+           "$install_cmd" 2>/dev/null; then
+        printf "ok:%s:%s\n"   "$install_func" "$install_ip" >"$tmpdir/${install_func//\//_}.result"
+      else
+        printf "fail:%s:%s\n" "$install_func" "$install_ip" >"$tmpdir/${install_func//\//_}.result"
+      fi
+    ) >/dev/null 2>&1 &
+    pids+=($!)
+  done
+
+  shopt -s nullglob
+  local done_count=0
+  while (( done_count < total )); do
+    local result_files=("$tmpdir"/*.result)
+    done_count="${#result_files[@]}"
+    progress_bar "$done_count" "$total" "installing..."
+    sleep 0.25
+  done
+  shopt -u nullglob
+  echo
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local ok=0 fail=0 result_file
+  for result_file in "$tmpdir"/*.result; do
+    [[ -f "$result_file" ]] || continue
+    local result; result="$(cat "$result_file")"
+    case "$result" in
+      ok:*)   ok=$(( ok + 1 )) ;;
+      fail:*) fail=$(( fail + 1 ))
+              local fhost; fhost="${result#fail:}"
+              log_warn "${fhost%%:*} (${fhost##*:}): install failed" ;;
+    esac
+  done
+
+  echo
+  if (( fail == 0 )); then
+    log_ok "Mesh keys installed: ${pubkey_count} source key(s) → ${ok}/${total} hosts."
+    if (( ${#src_indexes[@]} == 1 )); then
+      IFS=',' read -r src_ip src_func <<<"${hosts[${src_indexes[0]}]}"
+      src_func="$(trim "$src_func")"
+      log "INFO" "Test: from ${src_func}, run 'ssh ${username}@<other-host-ip>'"
+    else
+      log "INFO" "Test: ssh between any two hosts should now work without a password."
+    fi
+  else
+    log_warn "Mesh keys: ${ok}/${total} OK, ${fail} failed."
+  fi
+}
+
 # ──────────────────────────────────── Cleanup ───────────────────────────────
 cleanup() {
   rm -f "$CREDS_FILE"
@@ -825,7 +1011,8 @@ menu() {
     printf "  %s\n" "1) GO!  (RSYNC files to all hosts)"
     printf "  %s\n" "2) SSH  (open host session)"
     printf "  %s\n" "3) RSYNC again"
-    printf "  %s\n" "4) Install SSH keys to all hosts"
+    printf "  %s\n" "4) Install SSH keys to all hosts (laptop → host)"
+    printf "  %s\n" "m) Mesh SSH keys                  (host → host)"
     printf "  %s\n" "5) Dependency check"
     printf "  %s\n" "6) URLs (list lab web URLs)"
     printf "  %s\n" "7) Clean Up (delete creds)"
@@ -839,6 +1026,7 @@ menu() {
       2) ssh_menu;          read -r -p "  Press Enter to return to menu..." _ ;;
       3) rsync_only;        read -r -p "  Press Enter to return to menu..." _ ;;
       4) install_ssh_keys;  read -r -p "  Press Enter to return to menu..." _ ;;
+      m|M) mesh_ssh_keys;   read -r -p "  Press Enter to return to menu..." _ ;;
       5) ensure_hosts; ensure_creds; check_deps
                             read -r -p "  Press Enter to return to menu..." _ ;;
       6) list_urls;         read -r -p "  Press Enter to return to menu..." _ ;;
