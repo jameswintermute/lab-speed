@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.10.1 — May 2026 — James Wintermute
+# v1.11.0 — May 2026 — James Wintermute
 #
-# Changes from v1.10.0:
-#   - FIX: lab_clock crashed the menu loop right after Import when the
-#     credentials file didn't contain the optional LAB_WARN_SEC /
-#     LAB_LIMIT_SEC overrides. Under `set -Eeuo pipefail`, a no-match grep
-#     returns 1, which propagated through the pipeline and killed the script
-#     after drawing the banner. Now the no-match case is handled explicitly.
+# Changes from v1.10.1:
+#   - FIX: Import sometimes swapped the SSH user and the lab password when
+#     the password happened to be alphanumeric (e.g. 7rxg9krr). The parser
+#     "first identifier wins" heuristic could match the password before the
+#     SSH user. Now uses positional anchors ('admin' for the Splunk-UI
+#     column, 'Ready' for the status column) to lock columns in place.
+#     Falls back to the old heuristic only for non-standard pastes.
+#   - NEW: 'p) Show password' in the Keys section. Displays the lab password
+#     for ~10 seconds, then auto-clears. Also copies to the OS clipboard if
+#     xclip / wl-copy / pbcopy is available (silent best-effort). Press Enter
+#     during the countdown to clear immediately.
+#   - NEW: 'c) Refresh' next to Quit — explicit way to redraw the menu (and
+#     the lab clock). Any key works for refresh, but 'c' is discoverable.
+#   - Clock: dropped seconds from the display (now "00h 04m" not "00h 04m 23s")
+#     since it only refreshes on menu redraw — second-level accuracy was
+#     misleading.
+#   - Clean up (option 9) now performs a full lab-session reset: removes
+#     credentials, hosts list, and the lab-clock anchor (.lab-start). Confirms
+#     before deleting and lists exactly what will be removed. Backups created
+#     by Import (.bak-<timestamp>) and any retrieved files are untouched.
 #
 # Changes from v1.9.0:
 #   - Menu options renumbered to match visual reading order. Previously
@@ -127,7 +141,6 @@ lab_clock() {
 
   local h=$(( elapsed / 3600 ))
   local m=$(( (elapsed % 3600) / 60 ))
-  local s=$(( elapsed % 60 ))
 
   local color="$CLR_DIM"
   local suffix=""
@@ -139,9 +152,11 @@ lab_clock() {
     suffix=" — approaching limit"
   fi
 
-  printf "      %bLab time: %02dh %02dm %02ds%s%b\n" \
-    "$color" "$h" "$m" "$s" "$suffix" "$CLR_RST"
-  printf "      %b(elapsed since servers listed)%b\n" \
+  # Resolution is minutes only — implying second-level accuracy would be
+  # misleading since the clock only refreshes on menu redraw.
+  printf "      %bLab time: %02dh %02dm%s%b\n" \
+    "$color" "$h" "$m" "$suffix" "$CLR_RST"
+  printf "      %b(elapsed since servers listed — press 'c' to refresh)%b\n" \
     "$CLR_DIM" "$CLR_RST"
 }
 
@@ -153,7 +168,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.10.1 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.11.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
   lab_clock
 }
@@ -1214,17 +1229,54 @@ import_hosts() {
       }
       if (!has_ip || !has_url) next
 
-      # Identify each role by content
+      # Identify each role.
+      # Strategy: use position relative to known anchor tokens (admin for
+      # the Splunk-UI user column, Ready for the status column), because
+      # the heuristic of "first identifier wins" can swap the SSH user and
+      # the password when the password happens to be alphanumeric.
+      # The portal table format we expect: URL, ext-ip, int-ip, admin, PWD,
+      # ssh-user, Ready.
       url = ""; ext_ip = ""; int_ip = ""; ssh_user = ""; admin_pw = ""
+
+      # Find anchor positions
+      admin_idx = 0; ready_idx = 0
+      for (i=1; i<=n; i++) {
+        if (f[i] == "admin")                       admin_idx = i
+        if (f[i] == "Ready" || f[i] == "ready")    ready_idx = i
+      }
+
+      # Walk fields once to fill URL and IPs
       for (i=1; i<=n; i++) {
         v = f[i]
         if (is_url(v))                     url = v
         else if (is_ip(v) && is_priv(v))   int_ip = v
         else if (is_ip(v))                 ext_ip = v
-        else if (v == "admin")             continue   # admin = Splunk web UI user, not used
-        else if (v == "Ready" || v == "ready") continue
-        else if (v ~ /^[A-Za-z][A-Za-z0-9_]*$/ && length(v) < 32 && ssh_user == "") ssh_user = v
-        else if (admin_pw == "")           admin_pw = v
+      }
+
+      # Password is the cell right after the admin column; ssh-user is the
+      # cell right before the Ready column.
+      if (admin_idx > 0 && admin_idx + 1 <= n) {
+        cand = f[admin_idx + 1]
+        if (!is_url(cand) && !is_ip(cand)) admin_pw = cand
+      }
+      if (ready_idx > 1) {
+        cand = f[ready_idx - 1]
+        if (!is_url(cand) && !is_ip(cand) && cand != "admin") ssh_user = cand
+      }
+
+      # Fallback for non-standard pastes (no admin or Ready anchors):
+      # use the old heuristic so we degrade gracefully.
+      if (ssh_user == "" || admin_pw == "") {
+        for (i=1; i<=n; i++) {
+          v = f[i]
+          if (is_url(v) || is_ip(v))             continue
+          if (v == "admin" || v == "Ready" || v == "ready") continue
+          if (ssh_user == "" && v ~ /^[A-Za-z][A-Za-z0-9_]*$/ && length(v) < 32) {
+            ssh_user = v
+          } else if (admin_pw == "") {
+            admin_pw = v
+          }
+        }
       }
 
       if (url == "" || ext_ip == "") next
@@ -1488,10 +1540,94 @@ retrieve_files() {
   fi
 }
 
+# ──────────────────────────── Show password ────────────────────────────────
+# Displays the lab password on screen for ~10 seconds so the user can copy it
+# into the lab portal (or wherever it's needed), then clears the screen and
+# returns to the menu. Best-effort: also copies to the OS clipboard if a tool
+# is available (xclip / wl-copy / pbcopy).
+show_password() {
+  ensure_creds   # makes sure SSHPASS is exported into our env
+
+  local pw="${SSHPASS:-}"
+  if [[ -z "$pw" ]]; then
+    log_warn "No password set (have you run Import yet?)"
+    return 1
+  fi
+
+  # Try to copy to clipboard — succeed silently, fall back to display-only.
+  local clip_status=""
+  if   command -v wl-copy >/dev/null 2>&1; then
+    printf "%s" "$pw" | wl-copy 2>/dev/null && clip_status="copied to Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1; then
+    printf "%s" "$pw" | xclip -selection clipboard 2>/dev/null && clip_status="copied to X clipboard"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    printf "%s" "$pw" | pbcopy 2>/dev/null && clip_status="copied to macOS clipboard"
+  fi
+
+  # Display screen
+  clear
+  printf '\033]0;lab-speed — show password\007'
+  echo
+  printf "  %bLab password (hides in 10s):%b\n" "$CLR_YEL" "$CLR_RST"
+  echo
+  printf "    %b%s%b\n" "$CLR_GRN" "$pw" "$CLR_RST"
+  echo
+  if [[ -n "$clip_status" ]]; then
+    printf "  %b%s — paste with Ctrl-V (or Cmd-V).%b\n" "$CLR_DIM" "$clip_status" "$CLR_RST"
+  else
+    printf "  %bNo clipboard tool found (xclip / wl-copy / pbcopy) — select & copy by hand.%b\n" "$CLR_DIM" "$CLR_RST"
+  fi
+  echo
+
+  # Countdown with the option to bail early
+  local i
+  for (( i=10; i>0; i-- )); do
+    printf "\r  %bAuto-clearing in %2ds (press Enter to clear now)...%b" "$CLR_DIM" "$i" "$CLR_RST"
+    # -t 1: timeout 1s; -N 1: read exactly 1 char without needing Enter
+    if read -r -t 1 -N 1 _; then
+      break
+    fi
+  done
+
+  # Clear the line — header() will redraw the menu after we return
+  printf "\r%80s\r" " "
+}
+
 # ──────────────────────────────────── Cleanup ───────────────────────────────
 cleanup() {
-  rm -f "$CREDS_FILE"
-  log_ok "Deleted $CREDS_FILE"
+  # Show what would be removed
+  local -a to_remove=()
+  [[ -f "$CREDS_FILE"     ]] && to_remove+=("$CREDS_FILE")
+  [[ -f "$HOSTS_FILE"     ]] && to_remove+=("$HOSTS_FILE")
+  [[ -f "$LAB_START_FILE" ]] && to_remove+=("$LAB_START_FILE")
+
+  if (( ${#to_remove[@]} == 0 )); then
+    log "INFO" "Nothing to clean up — credentials, hosts list, and lab clock already absent."
+    return 0
+  fi
+
+  echo
+  printf "  %s\n" "Clean up will remove:"
+  local f
+  for f in "${to_remove[@]}"; do
+    printf "    - %s\n" "$f"
+  done
+  echo
+  printf "  %s\n" "This resets the lab session (clock returns to zero, hosts list cleared)."
+  printf "  %s\n" "Backups created by Import (.bak-<timestamp>) and any retrieved files in"
+  printf "  %s\n" "local/retrieved/ are NOT touched."
+  echo
+  read -r -p "  Proceed? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { log "INFO" "Cancelled — nothing removed."; return 0; }
+
+  for f in "${to_remove[@]}"; do
+    rm -f "$f"
+    log_ok "Removed $f"
+  done
+
+  # Clear the in-memory creds so subsequent options re-prompt rather than
+  # using stale values from the now-deleted file.
+  unset SSHPASS username password 2>/dev/null || true
 }
 
 # ─────────────────────────────────── Main menu ──────────────────────────────
@@ -1523,12 +1659,13 @@ menu() {
     menu_section "keys"
     printf "  %s\n" "6) Install SSH keys  (laptop → host)"
     printf "  %s\n" "m) Mesh SSH keys     (host → host)"
+    printf "  %s\n" "p) Show password    (copies to clipboard, hides in 10s)"
     echo
     menu_section "checks"
     printf "  %s\n" "7) Dependency check"
     printf "  %s\n" "8) Health check"
     echo
-    printf "  %s\n" "9) Clean up        q) Quit"
+    printf "  %s\n" "9) Clean up        c) Refresh        q) Quit"
     echo
     printf "  %b%s%b\n" "$CLR_DIM" "$REPO_URL" "$CLR_RST"
     echo
@@ -1543,10 +1680,12 @@ menu() {
       r|R) retrieve_files;   read -r -p "  Press Enter to return to menu..." _ ;;
       6)   install_ssh_keys; read -r -p "  Press Enter to return to menu..." _ ;;
       m|M) mesh_ssh_keys;    read -r -p "  Press Enter to return to menu..." _ ;;
+      p|P) show_password ;;  # no "Press Enter" — already has its own pause
       7)   ensure_hosts; ensure_creds; check_deps
                              read -r -p "  Press Enter to return to menu..." _ ;;
       8)   health_check;     read -r -p "  Press Enter to return to menu..." _ ;;
       9)   cleanup;          read -r -p "  Press Enter to return to menu..." _ ;;
+      c|C) ;;  # no-op — menu loop redraws header() on next iteration
       q|Q) exit 0 ;;
       *) log_warn "Invalid option"; sleep 0.5 ;;
     esac
