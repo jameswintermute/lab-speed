@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.8.0 — May 2026 — James Wintermute
+# v1.9.0 — May 2026 — James Wintermute
 #
-# Changes from v1.7.0:
+# Changes from v1.8.0:
+#   - NEW: Lab time elapsed counter below the version banner. Starts when the
+#     Import option succeeds (the moment "servers were listed"). Goes yellow
+#     at 3h30m and red at 4h — handy reminder that the cloud lab is about to
+#     shut down. Hidden if no import has been run, or if the timestamp is
+#     stale (>72h). Override thresholds in local/credentials.txt:
+#       LAB_WARN_SEC=12600   # yellow at 3h30m
+#       LAB_LIMIT_SEC=14400  # red at 4h
+#   - NEW: Repo URL shown at the bottom of every menu — helpful if a screenshot
+#     gets shared.
 #   - Menu redesigned with section headers (setup / connect / files / keys /
-#     checks) so the 13-item menu is now scannable at a glance. Same options,
-#     same keystrokes — purely a presentation change.
+#     checks) so the 13-item menu is now scannable at a glance.
 #
 # Changes from v1.6.0:
 #   - NEW: Option i = Import hosts — paste the lab credentials table from the
@@ -46,8 +54,10 @@ LOGS_DIR="$ROOT_DIR/logs"
 FILES_DIR="$ROOT_DIR/files-to-copy"
 HOSTS_FILE="$LOCAL_DIR/hosts.csv"
 CREDS_FILE="$LOCAL_DIR/credentials.txt"
+LAB_START_FILE="$LOCAL_DIR/.lab-start"   # epoch timestamp of last successful Import
 KNOWN_HOSTS_FILE="$ROOT_DIR/.known_hosts"
 TARGET_DIR="/tmp/lab-speed"
+REPO_URL="https://github.com/jameswintermute/lab-speed"
 mkdir -p "$LOCAL_DIR" "$LOGS_DIR" "$FILES_DIR"
 
 RUN_TAG="$(date +%Y%m%d-%H%M%S)-$$"
@@ -67,6 +77,60 @@ SSH_OPTS=(
 )
 
 # ─────────────────────────────── ASCII banner ───────────────────────────────
+# Compute elapsed time since the lab was imported (option i). Quiet if no
+# .lab-start file, or if the file is implausibly old (>72h — almost certainly
+# stale from a previous lab the user forgot to re-import).
+#
+# Colors:
+#   <3h30m  → dim (neutral)
+#   3h30m+  → yellow (approaching the typical 4h cut-off)
+#   4h+     → red (past typical cut-off — lab may shut down any moment)
+#
+# Override the soft/hard thresholds via local/credentials.txt:
+#   LAB_WARN_SEC=12600    # yellow at 3h30m   (default)
+#   LAB_LIMIT_SEC=14400   # red    at 4h      (default)
+lab_clock() {
+  [[ -f "$LAB_START_FILE" ]] || return 0
+  local start; start="$(cat "$LAB_START_FILE" 2>/dev/null)" || return 0
+  [[ "$start" =~ ^[0-9]+$ ]] || return 0
+  local now; now="$(date +%s)"
+  local elapsed=$(( now - start ))
+  (( elapsed < 0 )) && return 0       # clock skew — bail quietly
+  (( elapsed > 259200 )) && return 0  # >72h — almost certainly stale
+
+  # Threshold overrides — read straight from credentials.txt so they take
+  # effect even before ensure_creds has run. Falls back to defaults if the
+  # file doesn't exist or doesn't set them.
+  local warn=12600   # 3h30m default
+  local limit=14400  # 4h default
+  if [[ -f "$CREDS_FILE" ]]; then
+    local cw cl
+    cw="$(grep -E '^LAB_WARN_SEC='  "$CREDS_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'\''')"
+    cl="$(grep -E '^LAB_LIMIT_SEC=' "$CREDS_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'\''')"
+    [[ "$cw" =~ ^[0-9]+$ ]] && warn="$cw"
+    [[ "$cl" =~ ^[0-9]+$ ]] && limit="$cl"
+  fi
+
+  local h=$(( elapsed / 3600 ))
+  local m=$(( (elapsed % 3600) / 60 ))
+  local s=$(( elapsed % 60 ))
+
+  local color="$CLR_DIM"
+  local suffix=""
+  if (( elapsed >= limit )); then
+    color="$CLR_RED"
+    suffix=" — past typical cut-off"
+  elif (( elapsed >= warn )); then
+    color="$CLR_YEL"
+    suffix=" — approaching limit"
+  fi
+
+  printf "      %bLab time: %02dh %02dm %02ds%s%b\n" \
+    "$color" "$h" "$m" "$s" "$suffix" "$CLR_RST"
+  printf "      %b(elapsed since servers listed)%b\n" \
+    "$CLR_DIM" "$CLR_RST"
+}
+
 header() {
   clear
   printf '\033]0;lab-speed\007'   # set terminal window/tab title
@@ -75,8 +139,9 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.8.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.9.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
+  lab_clock
 }
 
 # ───────────────────────────────── Logging ──────────────────────────────────
@@ -1239,6 +1304,11 @@ import_hosts() {
     log_warn "Could not detect both SSH user and password — $CREDS_FILE not updated."
   fi
 
+  # Record the moment "the servers were listed" — this is when the lab clock
+  # starts ticking. Overwrites any previous timestamp; that's intentional —
+  # if the user re-imports it's a new lab.
+  date +%s >"$LAB_START_FILE"
+
   echo
   log "INFO" "Import complete. Run option 1 (GO!) to provision the hosts."
 }
@@ -1445,6 +1515,8 @@ menu() {
     printf "  %s\n" "9) Health check"
     echo
     printf "  %s\n" "7) Clean up        q) Quit"
+    echo
+    printf "  %b%s%b\n" "$CLR_DIM" "$REPO_URL" "$CLR_RST"
     echo
     read -r -p "  Select an option: " opt
     case "$opt" in
