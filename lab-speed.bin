@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.9.0 — May 2026 — James Wintermute
+# v1.10.0 — May 2026 — James Wintermute
+#
+# Changes from v1.9.0:
+#   - Menu options renumbered to match visual reading order. Previously
+#     numbers reflected the chronological order in which features were added
+#     (Broadcast at 8, Health check at 9, etc), which clashed with the
+#     section grouping introduced in v1.8. Now numbers count 1→9 top-to-bottom.
+#
+#     Old → New:  Broadcast 8→3,  URLs 6→4,  RSYNC again 3→5,
+#                 Install SSH keys 4→6,  Dependency check 5→7,
+#                 Health check 9→8,  Clean up 7→9.
+#     Letters unchanged: i, r, m, q. GO! (1) and SSH (2) unchanged.
 #
 # Changes from v1.8.0:
 #   - NEW: Lab time elapsed counter below the version banner. Starts when the
-#     Import option succeeds (the moment "servers were listed"). Goes yellow
-#     at 3h30m and red at 4h — handy reminder that the cloud lab is about to
-#     shut down. Hidden if no import has been run, or if the timestamp is
-#     stale (>72h). Override thresholds in local/credentials.txt:
-#       LAB_WARN_SEC=12600   # yellow at 3h30m
-#       LAB_LIMIT_SEC=14400  # red at 4h
-#   - NEW: Repo URL shown at the bottom of every menu — helpful if a screenshot
-#     gets shared.
-#   - Menu redesigned with section headers (setup / connect / files / keys /
-#     checks) so the 13-item menu is now scannable at a glance.
+#     Import option succeeds. Goes yellow at 3h30m and red at 4h. Override
+#     thresholds via LAB_WARN_SEC / LAB_LIMIT_SEC in local/credentials.txt.
+#   - NEW: Repo URL shown at the bottom of every menu.
+#   - Menu grouped into sections: setup / connect / files / keys / checks.
 #
 # Changes from v1.6.0:
 #   - NEW: Option i = Import hosts — paste the lab credentials table from the
@@ -139,7 +144,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.9.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.10.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
   lab_clock
 }
@@ -243,17 +248,17 @@ check_deps() {
       log_ok "$c"
     fi
   done
-  # ssh-copy-id is optional — only needed for option 4 (key install)
+  # ssh-copy-id is optional — only needed for option 6 (key install)
   if command -v ssh-copy-id >/dev/null 2>&1; then
-    log_ok "ssh-copy-id (optional — key install available via option 4)"
+    log_ok "ssh-copy-id (optional — key install available via option 6)"
   else
-    log_warn "ssh-copy-id not found — option 4 (SSH key install) unavailable"
+    log_warn "ssh-copy-id not found — option 6 (SSH key install) unavailable"
   fi
-  # tmux is optional — only needed for option 8 (broadcast)
+  # tmux is optional — only needed for option 3 (broadcast)
   if command -v tmux >/dev/null 2>&1; then
-    log_ok "tmux (optional — broadcast available via option 8)"
+    log_ok "tmux (optional — broadcast available via option 3)"
   else
-    log_warn "tmux not found — option 8 (Broadcast) unavailable"
+    log_warn "tmux not found — option 3 (Broadcast) unavailable"
   fi
   if (( missing )); then
     echo
@@ -285,7 +290,7 @@ read_hosts() {
 
 # ─────────────────────────────── Read hosts (full) ──────────────────────────
 # Emits "external-ip,internal-ip,function" lines. Used by callers that want
-# to display both IPs (option 2 SSH menu, option 9 Health check, option r
+# to display both IPs (option 2 SSH menu, option 8 Health check, option r
 # Retrieve). Internal-ip column may be missing — emit "-" in that case so
 # downstream callers can render a consistent layout.
 read_hosts_full() {
@@ -495,7 +500,7 @@ go_run() {
 
 rsync_only() {
   # Skips ensure_creds / check_deps when GO! has already been run this session.
-  # Falls back gracefully if the user jumps straight to option 3.
+  # Falls back gracefully if the user jumps straight to option 5.
   [[ -z "${SSHPASS:-}" ]] && ensure_creds
   ensure_hosts
   _run_parallel "RSYNC"
@@ -921,7 +926,7 @@ health_check() {
 #   hub-and-spoke: one chosen host can SSH to every host (incl. itself)
 #   full mesh:     every host can SSH to every host
 #
-# Note: option 4 sets up laptop→host. This option sets up host→host, which is
+# Note: option 6 sets up laptop→host. This option sets up host→host, which is
 # what you want for distributed-Splunk lab work (bundle pushes from the CM,
 # diag collection from a SH, etc).
 #
@@ -986,7 +991,7 @@ mesh_ssh_keys() {
   trap "rm -rf '$tmpdir'" RETURN
 
   # Remote script: idempotent keygen + emit pubkey
-  # Uses RSA 4096 to match option 4's key style.
+  # Uses RSA 4096 to match option 6's key style.
   local keygen_cmd
   keygen_cmd='
     mkdir -p ~/.ssh && chmod 700 ~/.ssh;
@@ -1499,40 +1504,40 @@ menu() {
     echo
     menu_section "connect"
     printf "  %s\n" "2) SSH         (open host session)"
-    printf "  %s\n" "8) Broadcast   (tmux all-hosts session)"
-    printf "  %s\n" "6) URLs        (list lab web URLs)"
+    printf "  %s\n" "3) Broadcast   (tmux all-hosts session)"
+    printf "  %s\n" "4) URLs        (list lab web URLs)"
     echo
     menu_section "files"
-    printf "  %s\n" "3) RSYNC again (laptop → hosts)"
+    printf "  %s\n" "5) RSYNC again (laptop → hosts)"
     printf "  %s\n" "r) Retrieve    (hosts → laptop)"
     echo
     menu_section "keys"
-    printf "  %s\n" "4) Install SSH keys  (laptop → host)"
+    printf "  %s\n" "6) Install SSH keys  (laptop → host)"
     printf "  %s\n" "m) Mesh SSH keys     (host → host)"
     echo
     menu_section "checks"
-    printf "  %s\n" "5) Dependency check"
-    printf "  %s\n" "9) Health check"
+    printf "  %s\n" "7) Dependency check"
+    printf "  %s\n" "8) Health check"
     echo
-    printf "  %s\n" "7) Clean up        q) Quit"
+    printf "  %s\n" "9) Clean up        q) Quit"
     echo
     printf "  %b%s%b\n" "$CLR_DIM" "$REPO_URL" "$CLR_RST"
     echo
     read -r -p "  Select an option: " opt
     case "$opt" in
       i|I) import_hosts;     read -r -p "  Press Enter to return to menu..." _ ;;
-      1) go_run;            read -r -p "  Press Enter to return to menu..." _ ;;
-      2) ssh_menu;          read -r -p "  Press Enter to return to menu..." _ ;;
-      3) rsync_only;        read -r -p "  Press Enter to return to menu..." _ ;;
-      r|R) retrieve_files;  read -r -p "  Press Enter to return to menu..." _ ;;
-      4) install_ssh_keys;  read -r -p "  Press Enter to return to menu..." _ ;;
-      m|M) mesh_ssh_keys;   read -r -p "  Press Enter to return to menu..." _ ;;
-      5) ensure_hosts; ensure_creds; check_deps
-                            read -r -p "  Press Enter to return to menu..." _ ;;
-      6) list_urls;         read -r -p "  Press Enter to return to menu..." _ ;;
-      7) cleanup;           read -r -p "  Press Enter to return to menu..." _ ;;
-      8) broadcast_tmux;    read -r -p "  Press Enter to return to menu..." _ ;;
-      9) health_check;      read -r -p "  Press Enter to return to menu..." _ ;;
+      1)   go_run;           read -r -p "  Press Enter to return to menu..." _ ;;
+      2)   ssh_menu;         read -r -p "  Press Enter to return to menu..." _ ;;
+      3)   broadcast_tmux;   read -r -p "  Press Enter to return to menu..." _ ;;
+      4)   list_urls;        read -r -p "  Press Enter to return to menu..." _ ;;
+      5)   rsync_only;       read -r -p "  Press Enter to return to menu..." _ ;;
+      r|R) retrieve_files;   read -r -p "  Press Enter to return to menu..." _ ;;
+      6)   install_ssh_keys; read -r -p "  Press Enter to return to menu..." _ ;;
+      m|M) mesh_ssh_keys;    read -r -p "  Press Enter to return to menu..." _ ;;
+      7)   ensure_hosts; ensure_creds; check_deps
+                             read -r -p "  Press Enter to return to menu..." _ ;;
+      8)   health_check;     read -r -p "  Press Enter to return to menu..." _ ;;
+      9)   cleanup;          read -r -p "  Press Enter to return to menu..." _ ;;
       q|Q) exit 0 ;;
       *) log_warn "Invalid option"; sleep 0.5 ;;
     esac
