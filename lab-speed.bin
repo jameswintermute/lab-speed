@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.11.1 — May 2026 — James Wintermute
+# v1.11.2 — May 2026 — James Wintermute
 #
-# Changes from v1.11.0:
-#   - FIX: Options that need lab context (p, 1, 2, 3, 4, 5, r, 6, m, 8) used
-#     to fall through to a generic "Lab username:" prompt on a fresh clone.
-#     Now they detect the no-session state and redirect the user to Import
-#     with a friendly explanation, instead of demanding manual credentials.
-#     The dependency check (7) and clean up (9) still work on a fresh clone
-#     since they have nothing to require.
+# Changes from v1.11.1:
+#   - FIX: require_lab_session was satisfied by the mere presence of
+#     credentials.txt / hosts.csv. If the repo had stub versions of those
+#     files committed (empty username/password), the guard let through and
+#     ensure_creds promptly dropped to a "Lab username:" prompt — defeating
+#     the whole point of v1.11.1. The guard now verifies real content
+#     (.lab-start exists OR credentials.txt has a non-empty username AND
+#     non-empty password).
+#   - FIX: Menu section dividers were inconsistent length because the
+#     trailing rule was a fixed string after a variable-length label.
+#     menu_section() now pads to a fixed total width.
+#
+# RECOMMENDED HOUSEKEEPING (in the repo):
+#   - Add a .gitignore that excludes local/credentials.txt, local/hosts.csv,
+#     local/.lab-start, and local/retrieved/. Otherwise a fresh clone ships
+#     stale state from whoever last committed.
 #
 # Changes from v1.11.0 (kept for reference):
-#   - FIX: Import sometimes swapped the SSH user and the lab password when
-#     the password happened to be alphanumeric (e.g. 7rxg9krr).
+#   - FIX: Import column-swap bug (alphanumeric passwords were being mistaken
+#     for the SSH user).
 #   - NEW: p) Show password — displays for 10s, copies to clipboard.
 #   - NEW: c) Refresh — explicit menu redraw.
 #   - Clock: dropped seconds (now "00h 04m").
@@ -163,7 +172,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.11.1 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.11.2 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
   lab_clock
 }
@@ -257,22 +266,32 @@ CSV
 }
 
 # ─────────────────────────────── Lab-session guard ──────────────────────────
-# Returns 0 if the lab session looks set up (either credentials or hosts.csv
-# exists), so the caller can proceed.
+# Returns 0 if a real lab session looks set up. Returns non-zero on a
+# "fresh clone / never imported" state, in which case it offers to redirect
+# the user to Import.
 #
-# Returns non-zero on a "fresh clone — never imported" state, in which case
-# it asks the user whether to jump straight to Import. If they say yes, it
-# runs import_hosts inline; either way the caller should return to the menu
-# rather than continue with its original action (the user came in via `p` or
-# `1` thinking the lab was already loaded, and we have nothing to act on).
+# Important: we don't trust the mere existence of credentials.txt or hosts.csv.
+# Stub versions of those files can be committed in the repo (e.g. checked-in
+# placeholder credentials with empty username/password), so file-exists alone
+# is not enough — we need to see real content.
+#
+# Real-session signals (any of these is enough):
+#   - .lab-start exists (set only by Import)
+#   - credentials.txt parses to a non-empty username AND non-empty password
 require_lab_session() {
-  # If either real file exists, we have a session. The placeholder hosts.csv
-  # planted by ensure_hosts is harmless — it only has example.com entries
-  # and the user will replace it via Import or by hand.
-  if [[ -f "$CREDS_FILE" ]] || [[ -f "$LAB_START_FILE" ]]; then
+  if [[ -f "$LAB_START_FILE" ]]; then
     return 0
   fi
-  # No credentials, no lab clock — we are on a fresh clone.
+  if [[ -f "$CREDS_FILE" ]]; then
+    # Try to read username/password without polluting our environment.
+    # Use a subshell so any sourced vars don't leak back.
+    # shellcheck disable=SC1090
+    if ( set +u; source "$CREDS_FILE" 2>/dev/null
+         [[ -n "${username:-}" && -n "${password:-}" ]] ); then
+      return 0
+    fi
+  fi
+  # No real session — offer to import.
 
   echo
   log_warn "No lab session yet — credentials and host details haven't been imported."
@@ -1672,9 +1691,20 @@ cleanup() {
 
 # ─────────────────────────────────── Main menu ──────────────────────────────
 # Small helper: prints a dim "── label ─────────" section header used in the
-# main menu. Keeps the loop body readable.
+# main menu. The trailing rule is padded so all section headers end at the
+# same column regardless of label length — looks cleaner against the magenta
+# banner above.
 menu_section() {
-  printf "  %b── %s ──────────────────────────%b\n" "$CLR_DIM" "$1" "$CLR_RST"
+  local label="$1"
+  # Total width we want for the header (without leading 2-space indent).
+  # "── LABEL ──" then dashes to fill. Pick something a little wider than the
+  # longest current label ("connect", 7 chars) so all of them fit.
+  local total=38
+  local prefix="── ${label} ──"
+  local pad=$(( total - ${#prefix} ))
+  (( pad < 0 )) && pad=0
+  local dashes; dashes="$(printf '─%.0s' $(seq 1 $pad))"
+  printf "  %b%s%s%b\n" "$CLR_DIM" "$prefix" "$dashes" "$CLR_RST"
 }
 
 menu() {
