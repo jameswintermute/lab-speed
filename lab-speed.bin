@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.11.0 — May 2026 — James Wintermute
+# v1.11.1 — May 2026 — James Wintermute
 #
-# Changes from v1.10.1:
+# Changes from v1.11.0:
+#   - FIX: Options that need lab context (p, 1, 2, 3, 4, 5, r, 6, m, 8) used
+#     to fall through to a generic "Lab username:" prompt on a fresh clone.
+#     Now they detect the no-session state and redirect the user to Import
+#     with a friendly explanation, instead of demanding manual credentials.
+#     The dependency check (7) and clean up (9) still work on a fresh clone
+#     since they have nothing to require.
+#
+# Changes from v1.11.0 (kept for reference):
 #   - FIX: Import sometimes swapped the SSH user and the lab password when
-#     the password happened to be alphanumeric (e.g. 7rxg9krr). The parser
-#     "first identifier wins" heuristic could match the password before the
-#     SSH user. Now uses positional anchors ('admin' for the Splunk-UI
-#     column, 'Ready' for the status column) to lock columns in place.
-#     Falls back to the old heuristic only for non-standard pastes.
-#   - NEW: 'p) Show password' in the Keys section. Displays the lab password
-#     for ~10 seconds, then auto-clears. Also copies to the OS clipboard if
-#     xclip / wl-copy / pbcopy is available (silent best-effort). Press Enter
-#     during the countdown to clear immediately.
-#   - NEW: 'c) Refresh' next to Quit — explicit way to redraw the menu (and
-#     the lab clock). Any key works for refresh, but 'c' is discoverable.
-#   - Clock: dropped seconds from the display (now "00h 04m" not "00h 04m 23s")
-#     since it only refreshes on menu redraw — second-level accuracy was
-#     misleading.
-#   - Clean up (option 9) now performs a full lab-session reset: removes
-#     credentials, hosts list, and the lab-clock anchor (.lab-start). Confirms
-#     before deleting and lists exactly what will be removed. Backups created
-#     by Import (.bak-<timestamp>) and any retrieved files are untouched.
+#     the password happened to be alphanumeric (e.g. 7rxg9krr).
+#   - NEW: p) Show password — displays for 10s, copies to clipboard.
+#   - NEW: c) Refresh — explicit menu redraw.
+#   - Clock: dropped seconds (now "00h 04m").
+#   - Clean up: full session reset with confirmation.
 #
 # Changes from v1.9.0:
 #   - Menu options renumbered to match visual reading order. Previously
@@ -168,7 +163,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.11.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.11.1 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
   lab_clock
 }
@@ -259,6 +254,41 @@ host-url,external-ip,internal-ip,function
 https://example-cm,1.2.3.4,10.0.0.1,Splunk-CM
 CSV
   fi
+}
+
+# ─────────────────────────────── Lab-session guard ──────────────────────────
+# Returns 0 if the lab session looks set up (either credentials or hosts.csv
+# exists), so the caller can proceed.
+#
+# Returns non-zero on a "fresh clone — never imported" state, in which case
+# it asks the user whether to jump straight to Import. If they say yes, it
+# runs import_hosts inline; either way the caller should return to the menu
+# rather than continue with its original action (the user came in via `p` or
+# `1` thinking the lab was already loaded, and we have nothing to act on).
+require_lab_session() {
+  # If either real file exists, we have a session. The placeholder hosts.csv
+  # planted by ensure_hosts is harmless — it only has example.com entries
+  # and the user will replace it via Import or by hand.
+  if [[ -f "$CREDS_FILE" ]] || [[ -f "$LAB_START_FILE" ]]; then
+    return 0
+  fi
+  # No credentials, no lab clock — we are on a fresh clone.
+
+  echo
+  log_warn "No lab session yet — credentials and host details haven't been imported."
+  log "INFO" "The fastest way to get started is option i (Import hosts from paste)."
+  echo
+  read -r -p "  Run Import now? (Y/n): " choice
+  case "$choice" in
+    n|N)
+      log "INFO" "OK — pick option i when you have the lab credentials table to hand."
+      return 1
+      ;;
+    *)
+      import_hosts
+      return 1   # Don't continue with the original option — let the user re-select
+      ;;
+  esac
 }
 
 # ─────────────────────────────── Dependency check ───────────────────────────
@@ -363,6 +393,7 @@ read_urls() {
 # Pretty-prints column 1 of local/hosts.csv (the host-url column) numbered and
 # labelled by function — handy for jumping to lab web UIs in a browser.
 list_urls() {
+  require_lab_session || return 0
   ensure_hosts
 
   mapfile -t rows < <(read_urls)
@@ -515,6 +546,7 @@ _run_parallel() {
 }
 
 go_run() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
   check_deps
@@ -523,6 +555,7 @@ go_run() {
 }
 
 rsync_only() {
+  require_lab_session || return 0
   # Skips ensure_creds / check_deps when GO! has already been run this session.
   # Falls back gracefully if the user jumps straight to option 5.
   [[ -z "${SSHPASS:-}" ]] && ensure_creds
@@ -535,6 +568,7 @@ rsync_only() {
 # After this, SSH connections no longer require sshpass (use option 2 normally
 # — it will fall through to key auth automatically once sshpass is unavailable).
 install_ssh_keys() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
 
@@ -657,6 +691,7 @@ open_ssh_terminal() {
 
 # ─────────────────────────────────── SSH menu ───────────────────────────────
 ssh_menu() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds   # ensures SSHPASS is exported
 
@@ -727,6 +762,7 @@ ssh_menu() {
 # Toggle off inside tmux with:  Ctrl-b :setw synchronize-panes off
 # Detach with Ctrl-b d, kill the session with Ctrl-b : kill-session.
 broadcast_tmux() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
 
@@ -838,6 +874,7 @@ broadcast_tmux() {
 # free mem, Splunk status + version. Useful right after GO! to catch silent
 # failures (rsync OK but host otherwise broken).
 health_check() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
 
@@ -962,6 +999,7 @@ health_check() {
 #   3. SSH to each "target" host and append the appropriate public key(s) to
 #      ~/.ssh/authorized_keys, deduping so re-runs are idempotent.
 mesh_ssh_keys() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
 
@@ -1390,6 +1428,7 @@ import_hosts() {
 #   3-5       — range
 #   3,7-9,11  — combination
 retrieve_files() {
+  require_lab_session || return 0
   ensure_hosts
   ensure_creds
 
@@ -1546,6 +1585,7 @@ retrieve_files() {
 # returns to the menu. Best-effort: also copies to the OS clipboard if a tool
 # is available (xclip / wl-copy / pbcopy).
 show_password() {
+  require_lab_session || return 0
   ensure_creds   # makes sure SSHPASS is exported into our env
 
   local pw="${SSHPASS:-}"
