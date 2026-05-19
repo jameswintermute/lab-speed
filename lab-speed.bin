@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.6.0 — May 2026 — James Wintermute
+# v1.7.0 — May 2026 — James Wintermute
+#
+# Changes from v1.6.0:
+#   - NEW: Option i = Import hosts — paste the lab credentials table from the
+#     lab portal; lab-speed parses it (tab- or whitespace-separated), derives
+#     the function name from each URL (cm1→CM, idx1→IDX1, shcd→SHC-Dep, …),
+#     and writes local/hosts.csv. Also detects the SSH user and admin
+#     password and offers to update local/credentials.txt. Existing files
+#     are backed up to .bak-<timestamp> first.
+#   - NEW: Option r = Retrieve — pull files from /tmp/lab-speed/ on each host
+#     back to local/retrieved/<timestamp>/<func>/. Lets you grab logs,
+#     configs, or output at the end of a lab. Supports per-host selection
+#     ('a' for all, '3,7' for individual hosts, or '3-5' for a range).
+#   - Internal IP now shown in: option 2 (SSH menu), option 9 (Health check),
+#     option r (Retrieve). The hosts.csv format is unchanged.
 #
 # Changes from v1.5.0:
 #   - NEW: Option m = Mesh SSH keys — sets up host-to-host SSH key auth.
@@ -66,7 +80,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.6.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.7.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -205,6 +219,32 @@ read_hosts() {
       gsub(/\r/, "", $ip_col)
       gsub(/\r/, "", $fn_col)
       if ($ip_col != "") print $ip_col "," $fn_col
+    }
+  ' "$HOSTS_FILE" | sed '/^[[:space:]]*$/d'
+}
+
+# ─────────────────────────────── Read hosts (full) ──────────────────────────
+# Emits "external-ip,internal-ip,function" lines. Used by callers that want
+# to display both IPs (option 2 SSH menu, option 9 Health check, option r
+# Retrieve). Internal-ip column may be missing — emit "-" in that case so
+# downstream callers can render a consistent layout.
+read_hosts_full() {
+  awk -F',' '
+    NR==1 {
+      for (i=1; i<=NF; i++) {
+        gsub(/\r/, "", $i)
+        h = tolower($i)
+        if (h == "external-ip" || h == "external_ip") ext_col = i
+        if (h == "internal-ip" || h == "internal_ip") int_col = i
+        if (h == "function") fn_col = i
+      }
+    }
+    NR>1 && ext_col && fn_col {
+      gsub(/\r/, "", $ext_col)
+      gsub(/\r/, "", $fn_col)
+      ic = "-"
+      if (int_col) { gsub(/\r/, "", $int_col); if ($int_col != "") ic = $int_col }
+      if ($ext_col != "") print $ext_col "," ic "," $fn_col
     }
   ' "$HOSTS_FILE" | sed '/^[[:space:]]*$/d'
 }
@@ -531,17 +571,19 @@ ssh_menu() {
   ensure_hosts
   ensure_creds   # ensures SSHPASS is exported
 
-  mapfile -t hosts < <(read_hosts)
+  mapfile -t hosts < <(read_hosts_full)
   local total="${#hosts[@]}"
   (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
 
   echo
-  local i=0 line ip func
+  printf "  %s\n" "  #  Function               External IP      Internal IP"
+  printf "  %s\n" "  -  --------               -----------      -----------"
+  local i=0 line ext_ip int_ip func
   for line in "${hosts[@]}"; do
     i=$(( i + 1 ))
-    IFS=',' read -r ip func <<<"$line"
-    ip="$(trim "$ip")"; func="$(trim "$func")"
-    printf "  %2d) %-22s %s\n" "$i" "${func:-HOST}" "$ip"
+    IFS=',' read -r ext_ip int_ip func <<<"$line"
+    ext_ip="$(trim "$ext_ip")"; int_ip="$(trim "$int_ip")"; func="$(trim "$func")"
+    printf "  %2d) %-22s %-16s %s\n" "$i" "${func:-HOST}" "$ext_ip" "${int_ip:--}"
   done
 
   echo
@@ -550,8 +592,9 @@ ssh_menu() {
   [[ "$sel" =~ ^[0-9]+$ ]] || { log_warn "Invalid selection"; return 0; }
   (( sel >= 1 && sel <= total )) || { log_warn "Selection out of range"; return 0; }
 
-  IFS=',' read -r ip func <<<"${hosts[$(( sel - 1 ))]}"
-  ip="$(trim "$ip")"; func="$(trim "$func")"
+  IFS=',' read -r ext_ip int_ip func <<<"${hosts[$(( sel - 1 ))]}"
+  ext_ip="$(trim "$ext_ip")"; int_ip="$(trim "$int_ip")"; func="$(trim "$func")"
+  local ip="$ext_ip"
 
   # Write a self-contained, self-deleting SSH session script.
   # Using a temp file avoids all nested-quoting issues when passing the SSH
@@ -709,7 +752,7 @@ health_check() {
   ensure_hosts
   ensure_creds
 
-  mapfile -t hosts < <(read_hosts)
+  mapfile -t hosts < <(read_hosts_full)
   local total="${#hosts[@]}"
   (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
 
@@ -738,17 +781,17 @@ health_check() {
     printf "%s|%s|%s|%s|%s|%s\n" "$h" "$up" "$disk" "$mem" "$sp" "$sv"
   '
 
-  local pids=() line ip func
+  local pids=() line ext_ip int_ip func
   for line in "${hosts[@]}"; do
-    IFS=',' read -r ip func <<<"$line"
-    ip="$(trim "$ip")"; func="$(trim "$func")"
+    IFS=',' read -r ext_ip int_ip func <<<"$line"
+    ext_ip="$(trim "$ext_ip")"; int_ip="$(trim "$int_ip")"; func="$(trim "$func")"
     (
       local out
-      if out=$(sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ip}" \
+      if out=$(sshpass -e ssh "${SSH_OPTS[@]}" "${username}@${ext_ip}" \
                 "$remote_cmd" 2>/dev/null); then
-        printf "ok|%s|%s|%s\n" "$func" "$ip" "$out" >"$tmpdir/${func//\//_}.result"
+        printf "ok|%s|%s|%s|%s\n" "$func" "$ext_ip" "$int_ip" "$out" >"$tmpdir/${func//\//_}.result"
       else
-        printf "fail|%s|%s|||||\n" "$func" "$ip" >"$tmpdir/${func//\//_}.result"
+        printf "fail|%s|%s|%s||||||\n" "$func" "$ext_ip" "$int_ip" >"$tmpdir/${func//\//_}.result"
       fi
     ) >/dev/null 2>&1 &
     pids+=($!)
@@ -769,20 +812,20 @@ health_check() {
     wait "$pid" 2>/dev/null || true
   done
 
-  # Render results table
+  # Render results table — added INT-IP column between EXT-IP and HOSTNAME
   echo
-  printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9s %s\n" \
-    "FUNC" "IP" "HOSTNAME" "UPTIME" "DISK/" "MEM" "SPLUNK" "VER"
-  printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9s %s\n" \
-    "----" "--" "--------" "------" "-----" "---" "------" "---"
+  printf "  %-8s %-15s %-13s %-12s %-15s %-7s %-7s %-9s %s\n" \
+    "FUNC" "EXT-IP" "INT-IP" "HOSTNAME" "UPTIME" "DISK/" "MEM" "SPLUNK" "VER"
+  printf "  %-8s %-15s %-13s %-12s %-15s %-7s %-7s %-9s %s\n" \
+    "----" "------" "------" "--------" "------" "-----" "---" "------" "---"
 
   local result_file ok=0 fail=0
   # Sort by function name so output order is stable across runs
   for result_file in $(ls "$tmpdir"/*.result 2>/dev/null | sort); do
     [[ -f "$result_file" ]] || continue
     local raw; raw="$(cat "$result_file")"
-    local status func2 ip2 host up disk mem sp sv
-    IFS='|' read -r status func2 ip2 host up disk mem sp sv <<<"$raw"
+    local status func2 ext2 int2 host up disk mem sp sv
+    IFS='|' read -r status func2 ext2 int2 host up disk mem sp sv <<<"$raw"
 
     if [[ "$status" == "ok" ]]; then
       ok=$(( ok + 1 ))
@@ -795,13 +838,13 @@ health_check() {
       elif [[ "$sp" == "down" ]]; then
         sp_disp=$(printf "%b%-7s%b" "$CLR_YEL" "down" "$CLR_RST")
       fi
-      printf "  %-8s %-15s %-12s %-15s %-7s %-7s %-9b %s\n" \
-        "${func2:-?}" "${ip2:-?}" "${host:-?}" "${up:-?}" \
+      printf "  %-8s %-15s %-13s %-12s %-15s %-7s %-7s %-9b %s\n" \
+        "${func2:-?}" "${ext2:-?}" "${int2:--}" "${host:-?}" "${up:-?}" \
         "${disk:-?}" "${mem:-?}" "$sp_disp" "${sv:-?}"
     else
       fail=$(( fail + 1 ))
-      printf "  %-8s %-15s %b%s%b\n" \
-        "${func2:-?}" "${ip2:-?}" "$CLR_RED" "UNREACHABLE" "$CLR_RST"
+      printf "  %-8s %-15s %-13s %b%s%b\n" \
+        "${func2:-?}" "${ext2:-?}" "${int2:--}" "$CLR_RED" "UNREACHABLE" "$CLR_RST"
     fi
   done
 
@@ -996,6 +1039,376 @@ mesh_ssh_keys() {
   fi
 }
 
+# ──────────────────────────────── Import hosts ──────────────────────────────
+# Paste the lab credentials table (from the lab portal webpage) and lab-speed
+# parses it into local/hosts.csv. Expected columns (order auto-detected by
+# content):
+#   URL, external-ip, internal-ip, admin-user, admin-password, ssh-user, status
+#
+# Function names are derived from the URL host portion (cm1→CM, idx1→IDX1,
+# shcd→SHC-Dep, etc). Existing local/hosts.csv and local/credentials.txt are
+# backed up to .bak-<timestamp> before being overwritten.
+import_hosts() {
+  echo
+  printf "  %s\n" "Paste the lab table from the portal (tab- or whitespace-separated)."
+  printf "  %s\n" "Each line should look something like:"
+  printf "  %s\n" "    https://...cm1...  18.219.29.53  10.0.72.87  admin  PWD  sccStudent  Ready"
+  printf "  %s\n" "When finished pasting, press Ctrl-D (or just Enter on an empty line)."
+  echo
+
+  # Read paste from stdin. We read until EOF; an empty line *also* terminates
+  # so users on terminals that don't pass Ctrl-D cleanly can still finish.
+  local -a raw_lines=()
+  local line empty_count=0
+  while IFS= read -r line; do
+    if [[ -z "$line" ]]; then
+      empty_count=$(( empty_count + 1 ))
+      (( empty_count >= 1 && ${#raw_lines[@]} > 0 )) && break
+      continue
+    fi
+    empty_count=0
+    raw_lines+=("$line")
+  done
+
+  if (( ${#raw_lines[@]} == 0 )); then
+    log_warn "No input received."
+    return 0
+  fi
+
+  # Parse with awk: detect column roles by content, not position.
+  # Output: function|external-ip|internal-ip|ssh-user|admin-password
+  # (URL is preserved so we can write the host-url column too)
+  local tmpdir; tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+
+  printf "%s\n" "${raw_lines[@]}" >"$tmpdir/raw.txt"
+
+  # Use awk to parse — split on tabs first, fall back to whitespace
+  awk '
+    function is_ip(s)   { return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ }
+    function is_url(s)  { return s ~ /^https?:\/\// }
+    function is_priv(s) { return s ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ }
+
+    # Derive function name from URL, e.g. ...-cm1.students.splunk.education → CM
+    function derive_func(url,    h, suffix, lower, upper) {
+      # Pull the host part: strip scheme and path
+      sub(/^https?:\/\//, "", url)
+      sub(/\/.*$/, "", url)
+      # Take the last hyphenated token before the first .
+      h = url
+      sub(/\..*$/, "", h)
+      # h is something like "esi3-911101-12c2d...05d-cm1" — take the last "-XYZ"
+      n = split(h, parts, "-")
+      suffix = parts[n]
+      lower = tolower(suffix)
+
+      # Well-known Splunk lab role mappings — keep these in sync with what
+      # the lab portal uses. Anything not in this table falls through to
+      # "uppercase the token verbatim" which gives a sensible default
+      # (e.g. unknown "foo2" → "FOO2"; user can edit hosts.csv manually).
+      if (lower == "cm1")  return "CM"
+      if (lower == "cm2")  return "CM2"
+      if (lower == "mc1")  return "MC"
+      if (lower == "mc2")  return "MC2"
+      if (lower == "shcd") return "SHC-Dep"
+      if (lower == "lm1")  return "LM"
+      if (lower == "dep")  return "Dep"
+      return toupper(suffix)
+    }
+
+    {
+      # Tab-split first; if only one field, fall back to whitespace-split
+      n = split($0, f, "\t")
+      if (n < 2) {
+        # remove leading/trailing whitespace then split on runs of whitespace
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+        n = split($0, f, /[[:space:]]+/)
+      }
+
+      # Trim each field
+      for (i=1; i<=n; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", f[i])
+      }
+
+      # Skip header-like rows (contain words like "URL", "External", "User"
+      # without containing actual IPs)
+      has_ip = 0; has_url = 0
+      for (i=1; i<=n; i++) {
+        if (is_ip(f[i]))  has_ip = 1
+        if (is_url(f[i])) has_url = 1
+      }
+      if (!has_ip || !has_url) next
+
+      # Identify each role by content
+      url = ""; ext_ip = ""; int_ip = ""; ssh_user = ""; admin_pw = ""
+      for (i=1; i<=n; i++) {
+        v = f[i]
+        if (is_url(v))                     url = v
+        else if (is_ip(v) && is_priv(v))   int_ip = v
+        else if (is_ip(v))                 ext_ip = v
+        else if (v == "admin")             continue   # admin = Splunk web UI user, not used
+        else if (v == "Ready" || v == "ready") continue
+        else if (v ~ /^[A-Za-z][A-Za-z0-9_]*$/ && length(v) < 32 && ssh_user == "") ssh_user = v
+        else if (admin_pw == "")           admin_pw = v
+      }
+
+      if (url == "" || ext_ip == "") next
+
+      func_name = derive_func(url)
+      printf "%s|%s|%s|%s|%s|%s\n", func_name, url, ext_ip, int_ip, ssh_user, admin_pw
+    }
+  ' "$tmpdir/raw.txt" >"$tmpdir/parsed.txt"
+
+  local parsed_count; parsed_count=$(wc -l <"$tmpdir/parsed.txt")
+  if (( parsed_count == 0 )); then
+    log_err "Couldn't parse any host rows from the paste."
+    log "INFO" "Expected each row to contain a URL and at least one IP."
+    return 1
+  fi
+
+  # Preview what we found
+  echo
+  log_ok "Parsed $parsed_count host row(s):"
+  printf "    %-10s %-58s %-15s %s\n" "FUNC" "URL" "EXT-IP" "INT-IP"
+  printf "    %-10s %-58s %-15s %s\n" "----" "---" "------" "------"
+  local fn url ext_ip int_ip ssh_user admin_pw
+  while IFS='|' read -r fn url ext_ip int_ip ssh_user admin_pw; do
+    # Truncate long URLs in the preview but keep full string in the CSV
+    local url_disp="$url"
+    [[ ${#url_disp} -gt 56 ]] && url_disp="${url_disp:0:55}…"
+    printf "    %-10s %-58s %-15s %s\n" "$fn" "$url_disp" "$ext_ip" "${int_ip:--}"
+  done <"$tmpdir/parsed.txt"
+
+  # Detect SSH user and admin password (use the first row's values; warn if rows differ)
+  local first_ssh_user="" first_admin_pw="" ssh_user_consistent=1 admin_pw_consistent=1
+  while IFS='|' read -r fn url ext_ip int_ip ssh_user admin_pw; do
+    if [[ -z "$first_ssh_user" ]]; then
+      first_ssh_user="$ssh_user"; first_admin_pw="$admin_pw"
+    else
+      [[ "$ssh_user" != "$first_ssh_user" ]] && ssh_user_consistent=0
+      [[ "$admin_pw" != "$first_admin_pw" ]] && admin_pw_consistent=0
+    fi
+  done <"$tmpdir/parsed.txt"
+
+  echo
+  if [[ -n "$first_ssh_user" ]] && (( ssh_user_consistent )); then
+    log_ok "Detected SSH user: $first_ssh_user"
+  elif [[ -n "$first_ssh_user" ]]; then
+    log_warn "SSH user varies across rows — using '$first_ssh_user' from the first row."
+  fi
+  if [[ -n "$first_admin_pw" ]] && (( admin_pw_consistent )); then
+    log_ok "Detected lab password (${#first_admin_pw} chars)"
+  elif [[ -n "$first_admin_pw" ]]; then
+    log_warn "Lab password varies across rows — using the value from the first row."
+  fi
+
+  # Confirm before writing
+  echo
+  read -r -p "  Write to $HOSTS_FILE and update $CREDS_FILE? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { log "INFO" "Cancelled — no files written."; return 0; }
+
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+
+  # Back up existing files
+  if [[ -f "$HOSTS_FILE" ]]; then
+    cp "$HOSTS_FILE" "${HOSTS_FILE}.bak-${ts}"
+    log "INFO" "Backed up existing hosts.csv → ${HOSTS_FILE}.bak-${ts}"
+  fi
+  if [[ -f "$CREDS_FILE" ]]; then
+    cp "$CREDS_FILE" "${CREDS_FILE}.bak-${ts}"
+    chmod 600 "${CREDS_FILE}.bak-${ts}"
+    log "INFO" "Backed up existing credentials.txt → ${CREDS_FILE}.bak-${ts}"
+  fi
+
+  # Write the new hosts.csv (matches the existing schema)
+  {
+    printf "host-url,external-ip,internal-ip,function\n"
+    while IFS='|' read -r fn url ext_ip int_ip ssh_user admin_pw; do
+      printf "%s,%s,%s,%s\n" "$url" "$ext_ip" "${int_ip:-}" "$fn"
+    done <"$tmpdir/parsed.txt"
+  } >"$HOSTS_FILE"
+  log_ok "Wrote $HOSTS_FILE ($parsed_count host(s))"
+
+  # Write credentials.txt only if we detected a user and password
+  if [[ -n "$first_ssh_user" && -n "$first_admin_pw" ]]; then
+    {
+      printf "# lab-speed credentials (chmod 600) — generated by Import on %s\n" "$(date)"
+      printf 'username="%s"\n' "$first_ssh_user"
+      printf 'password="%s"\n' "$first_admin_pw"
+      printf 'SSHPASS="%s"\n' "$first_admin_pw"
+    } >"$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+    log_ok "Wrote $CREDS_FILE"
+  else
+    log_warn "Could not detect both SSH user and password — $CREDS_FILE not updated."
+  fi
+
+  echo
+  log "INFO" "Import complete. Run option 1 (GO!) to provision the hosts."
+}
+
+# ─────────────────────────────────── Retrieve ───────────────────────────────
+# Pull files from /tmp/lab-speed/ on selected hosts back to
+# local/retrieved/<timestamp>/<func>/.
+#
+# Selection syntax:
+#   a         — all hosts
+#   3         — single host
+#   3,7,8     — multiple hosts
+#   3-5       — range
+#   3,7-9,11  — combination
+retrieve_files() {
+  ensure_hosts
+  ensure_creds
+
+  mapfile -t hosts < <(read_hosts_full)
+  local total="${#hosts[@]}"
+  (( total > 0 )) || die "No hosts found in $HOSTS_FILE"
+
+  echo
+  printf "  %s\n" "Retrieve files from /tmp/lab-speed/ on selected hosts:"
+  echo
+  printf "  %s\n" "  #  Function               External IP      Internal IP"
+  printf "  %s\n" "  -  --------               -----------      -----------"
+  local i=0 line ext_ip int_ip func
+  for line in "${hosts[@]}"; do
+    i=$(( i + 1 ))
+    IFS=',' read -r ext_ip int_ip func <<<"$line"
+    ext_ip="$(trim "$ext_ip")"; int_ip="$(trim "$int_ip")"; func="$(trim "$func")"
+    printf "  %2d) %-22s %-16s %s\n" "$i" "${func:-HOST}" "$ext_ip" "${int_ip:--}"
+  done
+  echo
+  printf "  %s\n" "Selection: 'a' for all, comma-separated (3,7), ranges (3-5), or combine (3,7-9)."
+  read -r -p "  Hosts to retrieve from (or q): " sel
+  [[ "$sel" == "q" || "$sel" == "Q" || -z "$sel" ]] && { log "INFO" "Cancelled."; return 0; }
+
+  # Resolve the selection into a list of host indexes (0-based)
+  local -a chosen=()
+  if [[ "$sel" == "a" || "$sel" == "A" ]]; then
+    for (( i=0; i<total; i++ )); do chosen+=("$i"); done
+  else
+    # Split on commas, then handle ranges
+    local token start end n
+    IFS=',' read -ra tokens <<<"$sel"
+    for token in "${tokens[@]}"; do
+      token="$(trim "$token")"
+      [[ -z "$token" ]] && continue
+      if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
+        start="${token%-*}"; end="${token#*-}"
+        if (( start < 1 || end > total || start > end )); then
+          log_warn "Range '$token' out of bounds (1-$total) — skipping."
+          continue
+        fi
+        for (( n=start; n<=end; n++ )); do chosen+=("$(( n - 1 ))"); done
+      elif [[ "$token" =~ ^[0-9]+$ ]]; then
+        if (( token < 1 || token > total )); then
+          log_warn "Host '$token' out of bounds (1-$total) — skipping."
+          continue
+        fi
+        chosen+=("$(( token - 1 ))")
+      else
+        log_warn "Unrecognised token '$token' — skipping."
+      fi
+    done
+  fi
+
+  if (( ${#chosen[@]} == 0 )); then
+    log_warn "No valid hosts selected."
+    return 0
+  fi
+
+  # Deduplicate while preserving order
+  local -a uniq=()
+  declare -A seen=()
+  for idx in "${chosen[@]}"; do
+    if [[ -z "${seen[$idx]:-}" ]]; then
+      uniq+=("$idx"); seen[$idx]=1
+    fi
+  done
+  chosen=("${uniq[@]}")
+
+  local chosen_count="${#chosen[@]}"
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  local dest_root="local/retrieved/$ts"
+  mkdir -p "$dest_root"
+
+  log "INFO" "Retrieving from $chosen_count host(s) in parallel → $dest_root/"
+
+  local tmpdir; tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+
+  # SSH transport for rsync (same options as the rest of the script)
+  local ssh_e; ssh_e="ssh"
+  for opt in "${SSH_OPTS[@]}"; do
+    ssh_e+=" $(printf '%q' "$opt")"
+  done
+
+  local pids=() idx
+  for idx in "${chosen[@]}"; do
+    IFS=',' read -r ext_ip int_ip func <<<"${hosts[$idx]}"
+    ext_ip="$(trim "$ext_ip")"; func="$(trim "$func")"
+    local safe_func="${func//\//_}"
+    safe_func="${safe_func// /_}"
+    local dest="$dest_root/${safe_func:-host-$(( idx + 1 ))}"
+    mkdir -p "$dest"
+
+    (
+      # Trailing slash on the source pulls the *contents* of /tmp/lab-speed/
+      # into the dest directory.
+      if sshpass -e rsync -a \
+           -e "$ssh_e" \
+           "${username}@${ext_ip}:$TARGET_DIR/" "$dest/" 2>/dev/null; then
+        local count; count=$(find "$dest" -mindepth 1 -type f 2>/dev/null | wc -l)
+        printf "ok|%s|%s|%d\n" "$func" "$ext_ip" "$count" >"$tmpdir/${safe_func}.result"
+      else
+        printf "fail|%s|%s|0\n" "$func" "$ext_ip" >"$tmpdir/${safe_func}.result"
+      fi
+    ) >/dev/null 2>&1 &
+    pids+=($!)
+  done
+
+  shopt -s nullglob
+  local done_count=0
+  while (( done_count < chosen_count )); do
+    local result_files=("$tmpdir"/*.result)
+    done_count="${#result_files[@]}"
+    progress_bar "$done_count" "$chosen_count" "pulling..."
+    sleep 0.25
+  done
+  shopt -u nullglob
+  echo
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Summarise
+  echo
+  local ok=0 fail=0 total_files=0 result_file
+  for result_file in $(ls "$tmpdir"/*.result 2>/dev/null | sort); do
+    [[ -f "$result_file" ]] || continue
+    local status fn host_ip nfiles
+    IFS='|' read -r status fn host_ip nfiles <<<"$(cat "$result_file")"
+    if [[ "$status" == "ok" ]]; then
+      ok=$(( ok + 1 ))
+      total_files=$(( total_files + nfiles ))
+      printf "  %b%-8s%b %s (%d file(s))\n" "$CLR_GRN" "$fn" "$CLR_RST" "$host_ip" "$nfiles"
+    else
+      fail=$(( fail + 1 ))
+      printf "  %b%-8s%b %s — retrieve failed\n" "$CLR_RED" "$fn" "$CLR_RST" "$host_ip"
+    fi
+  done
+
+  echo
+  if (( fail == 0 )); then
+    log_ok "Retrieved from $ok/$chosen_count host(s); $total_files file(s) total → $dest_root/"
+  else
+    log_warn "Retrieved from $ok/$chosen_count OK, $fail failed → $dest_root/"
+  fi
+}
+
 # ──────────────────────────────────── Cleanup ───────────────────────────────
 cleanup() {
   rm -f "$CREDS_FILE"
@@ -1008,10 +1421,12 @@ menu() {
 
   while true; do
     header
+    printf "  %s\n" "i) Import hosts from paste (NEW)"
     printf "  %s\n" "1) GO!  (RSYNC files to all hosts)"
     printf "  %s\n" "2) SSH  (open host session)"
-    printf "  %s\n" "3) RSYNC again"
-    printf "  %s\n" "4) Install SSH keys to all hosts (laptop → host)"
+    printf "  %s\n" "3) RSYNC again                    (laptop → hosts)"
+    printf "  %s\n" "r) Retrieve files from hosts      (hosts → laptop)"
+    printf "  %s\n" "4) Install SSH keys to all hosts  (laptop → host)"
     printf "  %s\n" "m) Mesh SSH keys                  (host → host)"
     printf "  %s\n" "5) Dependency check"
     printf "  %s\n" "6) URLs (list lab web URLs)"
@@ -1022,9 +1437,11 @@ menu() {
     echo
     read -r -p "  Select an option: " opt
     case "$opt" in
+      i|I) import_hosts;     read -r -p "  Press Enter to return to menu..." _ ;;
       1) go_run;            read -r -p "  Press Enter to return to menu..." _ ;;
       2) ssh_menu;          read -r -p "  Press Enter to return to menu..." _ ;;
       3) rsync_only;        read -r -p "  Press Enter to return to menu..." _ ;;
+      r|R) retrieve_files;  read -r -p "  Press Enter to return to menu..." _ ;;
       4) install_ssh_keys;  read -r -p "  Press Enter to return to menu..." _ ;;
       m|M) mesh_ssh_keys;   read -r -p "  Press Enter to return to menu..." _ ;;
       5) ensure_hosts; ensure_creds; check_deps
