@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.7.0 — May 2026 — James Wintermute
+# v1.8.0 — May 2026 — James Wintermute
+#
+# Changes from v1.7.0:
+#   - Menu redesigned with section headers (setup / connect / files / keys /
+#     checks) so the 13-item menu is now scannable at a glance. Same options,
+#     same keystrokes — purely a presentation change.
 #
 # Changes from v1.6.0:
 #   - NEW: Option i = Import hosts — paste the lab credentials table from the
@@ -18,31 +23,21 @@
 #
 # Changes from v1.5.0:
 #   - NEW: Option m = Mesh SSH keys — sets up host-to-host SSH key auth.
-#     Two modes:
-#       hub-and-spoke (default): one designated hub host can SSH to every
-#                                host (including itself). Useful for running
-#                                cluster commands from the CM/SH across the
-#                                indexers.
-#       full mesh:               every host can SSH to every host.
-#     Complements option 4 (which only sets up laptop → host).
+#     hub-and-spoke (default) or full mesh modes.
 #
 # Changes from v1.4.0:
-#   - NEW: Option 8 = Broadcast — opens tmux in a new terminal with one pane
-#     per host, synchronize-panes ON. Type once, hit every host.
-#   - NEW: Option 9 = Health check — parallel SSH; reports hostname, uptime,
-#     disk, mem, Splunk status + version. Renders a clean table.
+#   - NEW: Option 8 = Broadcast — tmux all-hosts session, type once hit all.
+#   - NEW: Option 9 = Health check — parallel SSH; uptime/disk/mem/Splunk.
 #
 # Changes from v1.3.0 (kept for reference):
-#   - FIX: RETURN trap on local tmpdir crashed under `set -u` ("line 310:
-#     tmpdir: unbound variable") — trap now uses double quotes so $tmpdir is
-#     baked in at trap-definition time.
-#   - NEW: After rsync, files on remote hosts are chmod -R 777.
-#   - NEW: Option 6 = URLs — lists the host-url column from local/hosts.csv.
+#   - FIX: line 310 unbound-variable crash on GO!/RSYNC.
+#   - NEW: chmod -R 777 on remote target after rsync.
+#   - NEW: Option 6 = URLs — lists host-url column from local/hosts.csv.
 set -Eeuo pipefail
 
 # ─────────────────────────────────── Colors ─────────────────────────────────
 CLR_MAG="\033[35m"; CLR_GRN="\033[32m"; CLR_RED="\033[31m"
-CLR_YEL="\033[33m"; CLR_CYN="\033[36m"; CLR_RST="\033[0m"
+CLR_YEL="\033[33m"; CLR_CYN="\033[36m"; CLR_DIM="\033[2m"; CLR_RST="\033[0m"
 
 # ─────────────────────────────────── Paths ──────────────────────────────────
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -80,7 +75,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.7.0 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.8.0 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
 }
 
@@ -1416,24 +1411,40 @@ cleanup() {
 }
 
 # ─────────────────────────────────── Main menu ──────────────────────────────
+# Small helper: prints a dim "── label ─────────" section header used in the
+# main menu. Keeps the loop body readable.
+menu_section() {
+  printf "  %b── %s ──────────────────────────%b\n" "$CLR_DIM" "$1" "$CLR_RST"
+}
+
 menu() {
   rotate_logs
 
   while true; do
     header
-    printf "  %s\n" "i) Import hosts from paste (NEW)"
-    printf "  %s\n" "1) GO!  (RSYNC files to all hosts)"
-    printf "  %s\n" "2) SSH  (open host session)"
-    printf "  %s\n" "3) RSYNC again                    (laptop → hosts)"
-    printf "  %s\n" "r) Retrieve files from hosts      (hosts → laptop)"
-    printf "  %s\n" "4) Install SSH keys to all hosts  (laptop → host)"
-    printf "  %s\n" "m) Mesh SSH keys                  (host → host)"
+
+    menu_section "setup"
+    printf "  %s\n" "i) Import hosts from paste"
+    printf "  %s\n" "1) GO!         (rsync files to all hosts)"
+    echo
+    menu_section "connect"
+    printf "  %s\n" "2) SSH         (open host session)"
+    printf "  %s\n" "8) Broadcast   (tmux all-hosts session)"
+    printf "  %s\n" "6) URLs        (list lab web URLs)"
+    echo
+    menu_section "files"
+    printf "  %s\n" "3) RSYNC again (laptop → hosts)"
+    printf "  %s\n" "r) Retrieve    (hosts → laptop)"
+    echo
+    menu_section "keys"
+    printf "  %s\n" "4) Install SSH keys  (laptop → host)"
+    printf "  %s\n" "m) Mesh SSH keys     (host → host)"
+    echo
+    menu_section "checks"
     printf "  %s\n" "5) Dependency check"
-    printf "  %s\n" "6) URLs (list lab web URLs)"
-    printf "  %s\n" "7) Clean Up (delete creds)"
-    printf "  %s\n" "8) Broadcast (tmux all-hosts session)"
-    printf "  %s\n" "9) Health check (uptime, disk, Splunk status)"
-    printf "  %s\n" "q) Quit"
+    printf "  %s\n" "9) Health check"
+    echo
+    printf "  %s\n" "7) Clean up        q) Quit"
     echo
     read -r -p "  Select an option: " opt
     case "$opt" in
