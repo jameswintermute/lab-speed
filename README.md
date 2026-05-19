@@ -4,6 +4,16 @@ A rapid lab setup utility for short‑lived training labs: distribute files to l
 
 ---
 
+## What's new in v1.11.1
+- **FIX — fresh-clone friendliness.** On a fresh clone, picking any option that needs lab context (e.g. `p` Show password, `1` GO!, `2` SSH) used to drop you into a manual `Lab username:` prompt — confusing if you reached for an option expecting an already-loaded session. Now the script detects the "no session yet" state and offers to jump straight to Import instead. Decline and you return to the menu cleanly.
+
+## What's new in v1.11.0
+- **NEW — `p` Show password** in the Keys section. Displays the lab password for ~10 seconds, then auto-clears. Press Enter during the countdown to clear immediately. If `xclip`, `wl-copy`, or `pbcopy` is installed, the password is silently copied to the OS clipboard at the same time.
+- **NEW — `c` Refresh.** Explicit menu redraw (and clock refresh). Any key works for refresh because the menu loop redraws on every iteration, but `c` is discoverable.
+- **FIX — Import column-swap bug.** The Import parser could swap the SSH user and the lab password when the password happened to be alphanumeric (e.g. `7rxg9krr` would land as `username` and `sccStudent` as `SSHPASS`). The parser now uses positional anchors — the literal `admin` and `Ready` cells in the portal table — to lock columns in place. Falls back to the old heuristic only when the anchors are missing (non-standard paste).
+- **Clock display** dropped seconds (now `Lab time: 00h 04m`, not `00h 04m 23s`) since it only refreshes on menu redraw — second-level accuracy was misleading. The caveat line was updated: "(elapsed since servers listed — press 'c' to refresh)".
+- **Clean up (option 9)** now performs a full lab-session reset: removes credentials, hosts list, AND the lab-clock anchor (`.lab-start`). Confirmation prompt lists exactly what will be removed. Import backups (`.bak-<timestamp>`) and retrieved files (`local/retrieved/`) are explicitly preserved.
+
 ## What's new in v1.10.0
 - **Menu options renumbered to match visual reading order.** Numbers now count 1→9 top-to-bottom inside the section groupings introduced in v1.8. `GO!` (1) and `SSH` (2) are unchanged; the options that had drifted out of sequence have moved:
 
@@ -121,12 +131,13 @@ r) Retrieve    (hosts → laptop)
 ── keys ──────────────────────────
 6) Install SSH keys  (laptop → host)
 m) Mesh SSH keys     (host → host)
+p) Show password    (copies to clipboard, hides in 10s)
 
 ── checks ──────────────────────────
 7) Dependency check
 8) Health check
 
-9) Clean up        q) Quit
+9) Clean up        c) Refresh        q) Quit
 ```
 
 | Key | Action | Notes |
@@ -140,10 +151,14 @@ m) Mesh SSH keys     (host → host)
 | **r** | **Retrieve files** | Pull `/tmp/lab-speed/` back from selected hosts (hosts → laptop) |
 | 6 | Install SSH keys | Parallel `ssh-copy-id` from **your laptop** to every host |
 | m | Mesh SSH keys | Sets up **host → host** passwordless SSH (hub-and-spoke or full mesh) |
+| **p** | **Show password** | Displays the lab password for 10s; copies to clipboard if `xclip` / `wl-copy` / `pbcopy` is installed |
 | 7 | Dependency check | Verifies required & optional tools are installed |
 | 8 | Health check | Parallel SSH; reports uptime, disk, memory, both IPs, Splunk status + version |
-| 9 | Clean up | Removes `local/credentials.txt` |
+| 9 | Clean up | Full lab-session reset: removes `credentials.txt`, `hosts.csv`, and `.lab-start` (confirmation required) |
+| **c** | **Refresh** | Redraw the menu and refresh the lab clock |
 | q | Quit | |
+
+> **First-run friendliness (v1.11.1+):** options that need lab context (`p`, `1`, `2`, `3`, `4`, `5`, `r`, `6`, `m`, `8`) detect a fresh-clone state and offer to jump to Import instead of dropping you into a manual credentials prompt.
 
 ---
 
@@ -152,9 +167,10 @@ m) Mesh SSH keys     (host → host)
 After option `i` runs, the banner picks up a counter:
 
 ```
-      v1.10.0 - May 2026. James Wintermute
-      Lab time: 01h 23m 45s
-      (elapsed since servers listed)
+      v1.11.1 - May 2026. James Wintermute
+
+      Lab time: 01h 23m
+      (elapsed since servers listed — press 'c' to refresh)
 ```
 
 The clock is colored:
@@ -162,14 +178,16 @@ The clock is colored:
 - **Yellow** at 3h30m — "approaching limit".
 - **Red** at 4h — "past typical cut-off".
 
-It refreshes every time you bounce back to the main menu (no background process). If your lab has a different cut-off, override the thresholds in `local/credentials.txt`:
+It refreshes every time you bounce back to the main menu (no background process). The display shows hours and minutes only — second-level accuracy would be misleading given the refresh model. Press `c` from the menu to force a redraw, or just pick any option and come back.
+
+If your lab has a different cut-off, override the thresholds in `local/credentials.txt`:
 
 ```bash
 LAB_WARN_SEC=10800    # yellow at 3h
 LAB_LIMIT_SEC=12600   # red    at 3h30m
 ```
 
-Re-running Import resets the clock to zero. If `local/.lab-start` is older than 72 hours (stale from a previous lab), the clock is hidden until you import again.
+Re-running Import resets the clock to zero. If `local/.lab-start` is older than 72 hours (stale from a previous lab), the clock is hidden until you import again. Option 9 (Clean up) also clears the clock as part of the full session reset.
 
 ---
 
@@ -237,6 +255,36 @@ Selection syntax:
 - `1,3-5,7` — combinations work
 
 Files land in `local/retrieved/<timestamp>/<func>/` so multiple retrievals don't clobber each other. The `chmod -R 777` that option 1 applies after rsync means everything is readable for the pull — no permissions friction.
+
+---
+
+## Show password (option `p`) — for pasting back into the portal
+
+Splunk lab portals frequently ask you to re-enter the lab admin password — sometimes several times during a single lab. Option `p` puts the password on screen for 10 seconds (long enough to select & copy, or copy from the clipboard if you've got a clipboard tool installed) and then auto-clears the screen.
+
+```
+  Lab password (hides in 10s):
+
+    7rxg9krr
+
+  copied to X clipboard — paste with Ctrl-V (or Cmd-V).
+
+  Auto-clearing in  7s (press Enter to clear now)...
+```
+
+The countdown ticks down on a single line, so you don't lose vertical space. Pressing Enter clears it immediately.
+
+### Clipboard support (optional)
+
+If one of these is installed, the password is silently copied to the OS clipboard at the same time as being displayed:
+
+| OS | Tool | Install |
+|---|---|---|
+| Linux / Wayland | `wl-copy` | `sudo apt install wl-clipboard` |
+| Linux / X11 | `xclip` | `sudo apt install xclip` |
+| macOS | `pbcopy` | preinstalled |
+
+Without any of those, the option still works — you just select & copy by hand.
 
 ---
 
@@ -330,11 +378,18 @@ sed -i 's/\r$//' local/hosts.csv
 ```
 
 ### Import: a row didn't parse
-The parser identifies columns by content, not position — it looks for a URL (`https?://`), one or two IPs (one private, one public), and the SSH user. If a row is silently dropped, check that:
+The parser anchors columns to the literal `admin` and `Ready` cells in the lab portal table (introduced in v1.11.0 to fix a swap bug where alphanumeric passwords were being mistaken for the SSH user). If a row is silently dropped, check that:
 - It actually contains a URL (not just a hostname).
-- The external IP is a public IP (the parser uses RFC1918 to distinguish internal vs external).
+- The row contains the words `admin` and `Ready` — these are the column anchors.
+- The external IP is a public IP and the internal IP is RFC1918 (10.x, 172.16–31.x, 192.168.x).
 - The columns aren't merged into one (paste preserved tabs or runs of whitespace).
+
+For non-standard pastes that lack the `admin`/`Ready` anchors, the parser falls back to a heuristic (first identifier wins for SSH user, anything else for password) — which can still swap the two if the password is alphanumeric. If that happens, edit `local/credentials.txt` by hand.
+
 Header rows are auto-skipped if they contain no IP/URL.
+
+### "No lab session yet" appears when picking an option
+This is normal on a fresh clone, or after running option 9 (Clean up). The script needs the lab credentials and host list before it can do most things. Accept the offer to run Import (it'll prompt you to paste the lab portal table), and you're ready in a few seconds.
 
 ### SSH session opens then immediately closes
 Some terminal profiles close the window on exit. Either adjust your terminal profile, or run SSH from the main lab-speed window (no GUI terminal launch).
