@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 # lab-speed — rapid lab setup utility
-# v1.11.2 — May 2026 — James Wintermute
+# v1.11.4 — May 2026 — James Wintermute
+#
+# Changes from v1.11.3:
+#   - Dependency check (option 7) now reports clipboard tools (wl-copy /
+#     xclip / pbcopy) as an optional dependency. Option p (Show password)
+#     already used them at runtime; this just surfaces the requirement so
+#     users know what to install for the auto-copy-to-clipboard behaviour.
+#   - Install hint extended with the optional extras line.
+#
+# Changes from v1.11.2:
+#   - Lab-session guard now md5-checks credentials.txt and hosts.csv against
+#     the known shipped defaults committed to the repo. This is a cleaner
+#     signal than "is content empty?" because it identifies the exact files
+#     the user hasn't touched yet. The empty-content check is kept as a
+#     fallback for any in-between state (e.g. user manually wiped values).
+#     When a default file is detected, the warning explicitly mentions it.
+#
+#     Shipped-default hashes:
+#       credentials.txt → 1d7643646c22b94ae3eb7bafcc13c98a
+#       hosts.csv       → 61f2720f815d3bf10b33e9d91b57c59c
+#     If you ever update the shipped versions in git, update SHIPPED_*_MD5
+#     constants below.
 #
 # Changes from v1.11.1:
-#   - FIX: require_lab_session was satisfied by the mere presence of
-#     credentials.txt / hosts.csv. If the repo had stub versions of those
-#     files committed (empty username/password), the guard let through and
-#     ensure_creds promptly dropped to a "Lab username:" prompt — defeating
-#     the whole point of v1.11.1. The guard now verifies real content
-#     (.lab-start exists OR credentials.txt has a non-empty username AND
-#     non-empty password).
-#   - FIX: Menu section dividers were inconsistent length because the
-#     trailing rule was a fixed string after a variable-length label.
-#     menu_section() now pads to a fixed total width.
-#
-# RECOMMENDED HOUSEKEEPING (in the repo):
-#   - Add a .gitignore that excludes local/credentials.txt, local/hosts.csv,
-#     local/.lab-start, and local/retrieved/. Otherwise a fresh clone ships
-#     stale state from whoever last committed.
+#   - FIX: require_lab_session strengthened against repo-shipped stubs.
+#   - FIX: section dividers padded to consistent width.
 #
 # Changes from v1.11.0 (kept for reference):
 #   - FIX: Import column-swap bug (alphanumeric passwords were being mistaken
@@ -172,7 +180,7 @@ header() {
   printf "%s\n" " ┃  ┣━┫┣┻┓   ┗━┓┣━┛┣╸ ┣╸  ┃┃╹"
   printf "%s\n" " ┗━╸╹ ╹┗━┛   ┗━┛╹  ┗━╸┗━╸╺┻┛╹"
   printf "\n%s\n" "      A rapid lab setup utility"
-  printf "\n%s\n" "      v1.11.2 - May 2026. James Wintermute"
+  printf "\n%s\n" "      v1.11.4 - May 2026. James Wintermute"
   printf "%b\n" "$CLR_RST"
   lab_clock
 }
@@ -266,35 +274,62 @@ CSV
 }
 
 # ─────────────────────────────── Lab-session guard ──────────────────────────
-# Returns 0 if a real lab session looks set up. Returns non-zero on a
+# Returns 0 if a real lab session looks set up. Returns non-zero on the
 # "fresh clone / never imported" state, in which case it offers to redirect
 # the user to Import.
 #
-# Important: we don't trust the mere existence of credentials.txt or hosts.csv.
-# Stub versions of those files can be committed in the repo (e.g. checked-in
-# placeholder credentials with empty username/password), so file-exists alone
-# is not enough — we need to see real content.
+# Why this exists: the repo ships stub local/credentials.txt and local/hosts.csv
+# (so the lab-speed.bin starts up cleanly on first run rather than crashing on
+# missing files). But that means "file exists" is not a reliable signal of
+# "user has set up their session" — we need to actually check the contents.
 #
-# Real-session signals (any of these is enough):
-#   - .lab-start exists (set only by Import)
-#   - credentials.txt parses to a non-empty username AND non-empty password
+# Two layers, defence-in-depth:
+#   1. md5 hash check against the shipped defaults — if the file is bit-for-bit
+#      identical to what ships in git, the user hasn't touched it.
+#   2. content check — if credentials.txt has empty username/password, treat
+#      as no session (handles the case where someone manually emptied it).
+#   3. .lab-start exists — written only by a successful Import, so this is the
+#      strongest positive signal.
+#
+# Known md5 hashes of files committed at github.com/jameswintermute/lab-speed:
+SHIPPED_CREDS_MD5="1d7643646c22b94ae3eb7bafcc13c98a"
+SHIPPED_HOSTS_MD5="61f2720f815d3bf10b33e9d91b57c59c"
+
 require_lab_session() {
+  # Strongest positive signal — only Import writes this.
   if [[ -f "$LAB_START_FILE" ]]; then
     return 0
   fi
-  if [[ -f "$CREDS_FILE" ]]; then
-    # Try to read username/password without polluting our environment.
-    # Use a subshell so any sourced vars don't leak back.
+
+  # Both files match the shipped defaults? Definitely no session.
+  local creds_is_default=0 hosts_is_default=0
+  if command -v md5sum >/dev/null 2>&1; then
+    if [[ -f "$CREDS_FILE" ]]; then
+      local cmd5; cmd5="$(md5sum "$CREDS_FILE" 2>/dev/null | cut -d' ' -f1)"
+      [[ "$cmd5" == "$SHIPPED_CREDS_MD5" ]] && creds_is_default=1
+    fi
+    if [[ -f "$HOSTS_FILE" ]]; then
+      local hmd5; hmd5="$(md5sum "$HOSTS_FILE" 2>/dev/null | cut -d' ' -f1)"
+      [[ "$hmd5" == "$SHIPPED_HOSTS_MD5" ]] && hosts_is_default=1
+    fi
+  fi
+
+  # If credentials.txt has real content (non-empty user + password) AND it's
+  # not the shipped default, we have a session.
+  if [[ -f "$CREDS_FILE" ]] && (( ! creds_is_default )); then
     # shellcheck disable=SC1090
     if ( set +u; source "$CREDS_FILE" 2>/dev/null
          [[ -n "${username:-}" && -n "${password:-}" ]] ); then
       return 0
     fi
   fi
-  # No real session — offer to import.
 
+  # No real session — offer to Import.
   echo
   log_warn "No lab session yet — credentials and host details haven't been imported."
+  if (( creds_is_default || hosts_is_default )); then
+    log "INFO" "(Detected shipped-default files in local/ — these are placeholders.)"
+  fi
   log "INFO" "The fastest way to get started is option i (Import hosts from paste)."
   echo
   read -r -p "  Run Import now? (Y/n): " choice
@@ -333,9 +368,24 @@ check_deps() {
   else
     log_warn "tmux not found — option 3 (Broadcast) unavailable"
   fi
+  # Clipboard tools are optional — only needed for option p (show password)
+  # to auto-copy to the OS clipboard. Any one of these is sufficient.
+  local clip_found=""
+  for c in wl-copy xclip pbcopy; do
+    if command -v "$c" >/dev/null 2>&1; then
+      clip_found="$c"
+      break
+    fi
+  done
+  if [[ -n "$clip_found" ]]; then
+    log_ok "$clip_found (optional — option p will auto-copy password to clipboard)"
+  else
+    log_warn "No clipboard tool found (xclip / wl-copy / pbcopy) — option p will display only"
+  fi
   if (( missing )); then
     echo
     log "INFO" "Install (Ubuntu/Debian): sudo apt-get update && sudo apt-get install -y openssh-client rsync gawk sed sshpass"
+    log "INFO" "Optional extras: sudo apt-get install -y ssh-copy-id tmux xclip"
     exit 1
   fi
 }
