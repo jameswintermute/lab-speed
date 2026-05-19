@@ -4,6 +4,18 @@ A rapid lab setup utility for short‑lived training labs: distribute files to l
 
 ---
 
+## What's new in v1.7.0
+- **NEW — Import hosts from paste (option `i`)**: paste the lab credentials table straight from the lab portal webpage. lab-speed parses the tab- or whitespace-separated rows, derives the function name from each URL (cm1 → CM, idx1 → IDX1, shcd → SHC-Dep, …), and writes both `local/hosts.csv` and `local/credentials.txt` in one step. Existing files are backed up to `.bak-<timestamp>` first. Replaces the manual tab-to-comma conversion most users were doing in a spreadsheet.
+- **NEW — Retrieve files (option `r`)**: pull files from `/tmp/lab-speed/` on selected hosts back to `local/retrieved/<timestamp>/<func>/`. Useful for grabbing logs, configs, or exercise output at the end of a lab. Supports `a` (all), comma-separated singles (`3,7,8`), ranges (`3-5`), or combinations (`1,3-5,7`).
+- **Internal IPs now visible** in option 2 (SSH menu), option 9 (Health check), and option `r` (Retrieve). The `hosts.csv` format is unchanged.
+
+## What's new in v1.6.0
+- **NEW — Mesh SSH keys (option `m`)**: sets up *host-to-host* passwordless SSH (option 4 only does laptop→host). Two modes:
+  - **Hub-and-spoke** (default): one chosen host gets passwordless SSH to every host. Ideal for distributed-Splunk work — bundle pushes from the CM, diag collection from a SH, etc.
+  - **Full mesh**: every host can SSH to every host. The tool warns and asks for confirmation before doing this.
+
+  Private keys never leave the lab — keypairs are generated *on* each source host, only public keys are collected and installed. `authorized_keys` is deduplicated, so re-running is idempotent.
+
 ## What's new in v1.5.0
 - **NEW — Broadcast (option 8)**: opens a tmux session in a new terminal with one pane per host, `synchronize-panes` ON by default. Type a command once, hit every host. Per-pane borders show which host is which. Requires `tmux` (optional dependency — only needed for this option).
 - **NEW — Health check (option 9)**: parallel SSH to every host; reports hostname, uptime, free disk on `/`, free memory, Splunk service status (up/down) and Splunk version. Useful immediately after **GO!** to catch silent failures (a host that rsynced fine but has e.g. a wedged Splunk service) before they cost you an hour.
@@ -28,40 +40,36 @@ cd lab-speed
 chmod +x lab-speed.bin
 ```
 
-### 2) Fill in `local/credentials.txt`
-Run the tool once — it will prompt and store with `chmod 600`:
-```bash
-./lab-speed.bin
-```
-Or edit manually:
+### 2) Import the lab credentials (option `i` — recommended)
+The fastest path: from the menu, press `i`, paste the credentials table directly from your lab portal webpage (tabs or whitespace work), then press Enter on an empty line. lab-speed parses the table and writes both `local/hosts.csv` and `local/credentials.txt` for you. See [Import hosts](#import-hosts-option-i--paste-from-the-lab-portal) below for the full walkthrough.
 
-`local/credentials.txt`
+If you'd rather fill them in by hand, the format is:
+
+`local/credentials.txt` (chmod 600):
 ```bash
-# lab-speed credentials (chmod 600)
 username="YOUR_LAB_USERNAME"
 password="YOUR_LAB_PASSWORD"
 SSHPASS="YOUR_LAB_PASSWORD"   # must match password
 ```
 
-> **Note:** `SSHPASS` is passed via environment variable (not the command line) so it does not appear in the process list.
-
-### 3) Fill in `local/hosts.csv`
-Required columns (column order does not matter — they're matched by header name):
+`local/hosts.csv` — required columns (column order doesn't matter, matched by header name):
 - `host-url` — the lab web URL for option 6 (URLs)
 - `external-ip` — the IP lab-speed connects to
+- `internal-ip` — shown in option 2, 9, and r (optional)
 - `function` — friendly label (e.g. `CM`, `IDX1`, `SH1`)
 
-Example:
 ```csv
 host-url,external-ip,internal-ip,function
 https://example-cm.lab,1.2.3.4,10.0.0.1,CM
 https://example-idx1.lab,2.3.5.157,10.0.0.2,IDX1
 ```
 
-### 4) Put files you want copied into `files-to-copy/`
+> **Note:** `SSHPASS` is passed via environment variable (not the command line) so it does not appear in the process list.
+
+### 3) Put files you want copied into `files-to-copy/`
 Everything in `files-to-copy/` is copied to each lab host. Remote target: `/tmp/lab-speed/`. Permissions are set to `777` after copy so you can read/edit/execute without fighting access.
 
-### 5) Run **GO!** (menu option 1)
+### 4) Run **GO!** (menu option 1)
 - **1) GO! (RSYNC files to all hosts)**
 
 This will:
@@ -70,8 +78,11 @@ This will:
 3. Run `chmod -R 777` on the remote target on each host.
 4. Print a clear end summary and recommend next steps.
 
-### 6) (Recommended) Run **Health check** (option 9)
+### 5) (Recommended) Run **Health check** (option 9)
 Right after GO!, run the health check to confirm every host actually came up the way you expect — same status for everything is the green light to start work.
+
+### 6) (At the end of the lab) **Retrieve files** (option `r`)
+Pull `/tmp/lab-speed/` back from any hosts you care about — useful for grabbing logs, exercise output, or modified configs before the lab tears down.
 
 ---
 
@@ -79,15 +90,96 @@ Right after GO!, run the health check to confirm every host actually came up the
 
 | # | Action | Notes |
 |---|--------|-------|
+| **i** | **Import hosts** | Paste the lab portal table → writes `hosts.csv` + `credentials.txt` |
 | 1 | GO! | Provision all hosts in parallel (rsync + chmod 777) |
-| 2 | SSH | Function-first host list; opens a password-free session (new terminal when available) |
-| 3 | RSYNC again | Re-push `files-to-copy/` to all hosts; skips dependency check for speed |
-| 4 | Install SSH keys | Parallel `ssh-copy-id` to every host (subsequent SSH no longer needs sshpass) |
+| 2 | SSH | Function-first host list with both IPs; opens a password-free session |
+| 3 | RSYNC again | Re-push `files-to-copy/` to all hosts (laptop → hosts) |
+| **r** | **Retrieve files** | Pull `/tmp/lab-speed/` back from selected hosts (hosts → laptop) |
+| 4 | Install SSH keys | Parallel `ssh-copy-id` from **your laptop** to every host |
+| m | Mesh SSH keys | Sets up **host → host** passwordless SSH (hub-and-spoke or full mesh) |
 | 5 | Dependency check | Verifies required & optional tools are installed |
 | 6 | URLs | Lists the `host-url` column from `hosts.csv` (handy for browser tabs) |
 | 7 | Clean Up | Removes `local/credentials.txt` |
 | 8 | Broadcast | Opens tmux in a new terminal — one pane per host, type once, hit every host |
-| 9 | Health check | Parallel SSH; reports uptime, disk, memory, Splunk status + version |
+| 9 | Health check | Parallel SSH; reports uptime, disk, memory, **both IPs**, Splunk status + version |
+
+---
+
+## Import hosts (option `i`) — paste from the lab portal
+
+The lab portal typically shows a table like:
+
+```
+URL                                           External IP    Internal IP   Admin   Password   SSH User    Status
+https://esi3-…-cm1.students.splunk.education  18.219.29.53   10.0.72.87    admin   38pehhg6   sccStudent  Ready
+https://esi3-…-mc1.students.splunk.education  3.128.188.138  10.0.76.249   admin   38pehhg6   sccStudent  Ready
+…
+```
+
+Previously you'd copy this and hand-edit it into `local/hosts.csv` — tabs to commas, removing columns you don't need, adding the function column. **Option `i` automates that:**
+
+1. From the menu, press `i`.
+2. Paste the table (tabs or runs of whitespace both work).
+3. Press **Enter on an empty line** (or **Ctrl-D**) to finish.
+4. lab-speed parses each row, derives the **function** name from the URL (cm1 → CM, idx1 → IDX1, shcd → SHC-Dep, etc), detects the SSH user and lab password, and shows a preview.
+5. Confirm with `y` and it writes:
+   - `local/hosts.csv` with the parsed rows.
+   - `local/credentials.txt` with `username`, `password`, and `SSHPASS` set.
+6. Any existing files are backed up to `.bak-<timestamp>` first — safe to re-run.
+
+### Function-name mapping
+
+| URL token | Function |
+|-----------|----------|
+| `cm1` / `cm2` | `CM` / `CM2` |
+| `mc1` / `mc2` | `MC` / `MC2` |
+| `idx1`, `idx2`, … | `IDX1`, `IDX2`, … |
+| `sh1`, `sh2`, `sh3` | `SH1`, `SH2`, `SH3` |
+| `shcd` | `SHC-Dep` (Search Head Cluster Deployer) |
+| `hf1` | `HF1` (Heavy Forwarder) |
+| `lm1` | `LM` (License Manager) |
+| `ldap` | `LDAP` |
+| anything else | uppercase of the URL token verbatim |
+
+If you get an unexpected function name, just edit `local/hosts.csv` afterwards — the rest of the tool only cares about the column values, not how they were derived.
+
+---
+
+## Retrieve files (option `r`) — pull from hosts
+
+At the end of a lab you often want to grab the configs, logs, or exercise output sitting in `/tmp/lab-speed/` on each host. Option `r` does that in parallel:
+
+```
+  #  Function               External IP      Internal IP
+  -  --------               -----------      -----------
+  1) CM                     18.219.29.53     10.0.72.87
+  2) MC                     3.128.188.138    10.0.76.249
+  3) IDX1                   3.17.141.176     10.0.78.144
+  …
+Selection: 'a' for all, comma-separated (3,7), ranges (3-5), or combine (3,7-9).
+```
+
+Selection syntax:
+
+- `a` — all hosts
+- `3` — just host 3
+- `3,7,8` — hosts 3, 7, and 8
+- `3-5` — hosts 3 through 5
+- `1,3-5,7` — combinations work
+
+Files land in `local/retrieved/<timestamp>/<func>/` so multiple retrievals don't clobber each other. The `chmod -R 777` that option 1 applies after rsync means everything is readable for the pull — no permissions friction.
+
+---
+
+## Mesh SSH keys (option `m`) — host-to-host passwordless SSH
+
+Option 4 sets up **your laptop → each host**. Option `m` sets up **host → host**, which is what you need for distributed-Splunk operations (cluster-bundle pushes, `splunk diag` collection, ad-hoc `scp` between hosts).
+
+**Hub-and-spoke** (recommended): pick one host as the hub (typically the CM or a SH); the hub gets passwordless SSH to every host including itself. Fast, simple, covers most lab work.
+
+**Full mesh**: every host can SSH to every host. Useful if your exercises require any-host-to-any-host connectivity. The tool warns and asks for confirmation first.
+
+Implementation: lab-speed SSHes to each source host and runs `ssh-keygen` *on the host* if no key exists. The public key is read back; **the private key never leaves the host**. The collected public keys are then appended to `~/.ssh/authorized_keys` on every host in parallel, deduped in place — so re-running is idempotent.
 
 ---
 
